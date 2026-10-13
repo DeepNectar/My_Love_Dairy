@@ -3,3 +3,8 @@ node_modules/
 dist/
 build/
 *.log
+
+# Local environment variables
+.env
+.env.*
+!.env.example

@@ -31,9 +31,26 @@ function App() {
 
   // Check auth state on mount
   useEffect(() => {
-    checkUser();
+    let mounted = true;
+
+    // Restore any existing session first so we don't flash the login screen
+    supabase.auth.getSession().then(({ data: { session } }) => {
+      if (!mounted) return;
+      const u = session?.user ?? null;
+      setUser(u);
+      if (u) {
+        fetchEntries();
+        if (u.user_metadata?.full_name) {
+          setSenderName(u.user_metadata.full_name);
+        }
+      }
+      setLoading(false);
+    });
+
     const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!mounted) return;
       setUser(session?.user ?? null);
+      setLoading(false);
       if (session?.user) {
         fetchEntries();
         // Load sender name from user metadata
@@ -45,7 +62,10 @@ function App() {
       }
     });
 
-    return () => subscription.unsubscribe();
+    return () => {
+      mounted = false;
+      subscription.unsubscribe();
+    };
   }, []);
 
   // Fetch entries when user changes
@@ -56,28 +76,38 @@ function App() {
   }, [user]);
 
   const checkUser = async () => {
-    const { data: { user } } = await supabase.auth.getUser();
-    setUser(user);
-    if (user) {
-      fetchEntries();
-      if (user.user_metadata?.full_name) {
-        setSenderName(user.user_metadata.full_name);
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      setUser(user);
+      if (user) {
+        fetchEntries();
+        if (user.user_metadata?.full_name) {
+          setSenderName(user.user_metadata.full_name);
+        }
       }
+    } catch (err) {
+      console.error('Auth check failed:', err);
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   const fetchEntries = async () => {
-    const { data, error } = await supabase
-      .from('diary_entries')
-      .select('*')
-      .order('created_at', { ascending: false });
+    try {
+      const { data, error } = await supabase
+        .from('diary_entries')
+        .select('*')
+        .order('created_at', { ascending: false });
 
-    if (error) {
-      console.error('Error fetching entries:', error);
+      if (error) {
+        console.error('Error fetching entries:', error);
+        setImportStatus({ type: 'error', message: 'Failed to load entries' });
+      } else {
+        setEntries(data.map(mapSupabaseEntry));
+      }
+    } catch (err) {
+      console.error('Error fetching entries:', err);
       setImportStatus({ type: 'error', message: 'Failed to load entries' });
-    } else {
-      setEntries(data.map(mapSupabaseEntry));
     }
   };
 

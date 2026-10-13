@@ -2,6 +2,8 @@ import { useState, useEffect, useRef } from 'react';
 import { supabase, DiaryEntry as SupabaseEntry } from './lib/supabase';
 import Auth from './components/Auth';
 import { HEADING_CATEGORIES, defaultHeading, buildHeadingText, parseTemplateEntries } from './lib/headings';
+import { FIXED_USER_ID, getFixedSupabaseUserId } from './lib/hardcodedAuth';
+import { readLocalSession, clearLocalSession } from './lib/localSession';
 
 interface DiaryEntry {
   id: string;
@@ -29,70 +31,47 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
-  // Check auth state on mount
+  // Check auth state on mount — hardcoded login gate (DeepNectar)
   useEffect(() => {
     let mounted = true;
 
-    // Restore any existing session first so we don't flash the login screen
-    supabase.auth.getSession().then(({ data: { session } }) => {
-      if (!mounted) return;
-      const u = session?.user ?? null;
-      setUser(u);
-      if (u) {
-        fetchEntries();
-        if (u.user_metadata?.full_name) {
-          setSenderName(u.user_metadata.full_name);
+    const initAuth = async () => {
+      try {
+        const session = await readLocalSession();
+        if (!mounted) return;
+        if (session) {
+          const uid = await getFixedSupabaseUserId();
+          if (!mounted) return;
+          setUser({ id: uid, email: FIXED_USER_ID, name: FIXED_USER_ID });
+          setSenderName(FIXED_USER_ID);
+          fetchEntries(uid);
         }
+      } catch (err) {
+        console.error('Auth check failed:', err);
+      } finally {
+        if (mounted) setLoading(false);
       }
-      setLoading(false);
-    });
+    };
 
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
-      if (!mounted) return;
-      setUser(session?.user ?? null);
-      setLoading(false);
-      if (session?.user) {
-        fetchEntries();
-        // Load sender name from user metadata
-        if (session.user.user_metadata?.full_name) {
-          setSenderName(session.user.user_metadata.full_name);
-        }
-      } else {
-        setEntries([]);
-      }
-    });
+    initAuth();
 
     return () => {
       mounted = false;
-      subscription.unsubscribe();
     };
   }, []);
 
-  // Fetch entries when user changes
-  useEffect(() => {
-    if (user) {
-      fetchEntries();
-    }
-  }, [user]);
-
-  const checkUser = async () => {
+  const handleAuthSuccess = async () => {
     try {
-      const { data: { user } } = await supabase.auth.getUser();
-      setUser(user);
-      if (user) {
-        fetchEntries();
-        if (user.user_metadata?.full_name) {
-          setSenderName(user.user_metadata.full_name);
-        }
-      }
+      const uid = await getFixedSupabaseUserId();
+      setUser({ id: uid, email: FIXED_USER_ID, name: FIXED_USER_ID });
+      setSenderName(FIXED_USER_ID);
+      fetchEntries(uid);
     } catch (err) {
-      console.error('Auth check failed:', err);
-    } finally {
-      setLoading(false);
+      console.error('Post-login setup failed:', err);
     }
   };
 
-  const fetchEntries = async () => {
+  const fetchEntries = async (_uid?: string) => {
     try {
       const { data, error } = await supabase
         .from('diary_entries')
@@ -151,7 +130,12 @@ function App() {
   };
 
   const handleLogout = async () => {
-    await supabase.auth.signOut();
+    clearLocalSession();
+    try {
+      await supabase.auth.signOut();
+    } catch {
+      /* ignore — hardcoded session is what matters */
+    }
     setUser(null);
     setEntries([]);
   };
@@ -164,7 +148,7 @@ function App() {
       user_id: user.id,
       heading: heading || defaultHeading(),
       date_time: getCurrentDateTime(),
-      sender_name: senderName || user.email || 'Anonymous',
+      sender_name: senderName || FIXED_USER_ID,
       message: message.trim(),
       reflection: reflection.trim(),
     };
@@ -441,9 +425,9 @@ function App() {
     );
   }
 
-  // Show auth if not logged in
+  // Show auth if not logged in (hardcoded DeepNectar login gate)
   if (!user) {
-    return <Auth onAuthSuccess={() => {}} />;
+    return <Auth onAuthSuccess={handleAuthSuccess} />;
   }
 
   return (

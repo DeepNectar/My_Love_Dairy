@@ -10,7 +10,22 @@ import {
   dateRangeOf,
 } from './lib/headings';
 import { FIXED_USER_ID, ensureSupabaseSession } from './lib/hardcodedAuth';
-import { readLocalSession, clearLocalSession } from './lib/localSession';
+import { readLocalSession, clearLocalSession, writeLocalSessionItem, readLocalSessionItem } from './lib/localSession';
+import { exportPagesToA4Pdf } from './lib/pdfExport';
+import { paginateBlocks, estimateTextHeightUnits, type PageBlock } from './lib/paginate';
+
+// Sticker: an image (from a link) placed anywhere on an A4 page.
+interface Sticker {
+  id: string;
+  url: string;
+  page: number;   // 0-based page index it is pinned to
+  xPct: number;   // horizontal position as % of page width
+  yPct: number;   // vertical position as % of page height
+  sizePct: number; // width as % of page width
+  rotate: number;  // degrees
+}
+
+const STICKERS_KEY = 'diary_stickers_v1';
 
 interface DiaryEntry {
   id: string;
@@ -37,6 +52,21 @@ function App() {
   const [loading, setLoading] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+
+  // --- A4 book view state ---
+  const [currentPage, setCurrentPage] = useState(0);
+  const [sheetScale, setSheetScale] = useState(1);
+  const sheetWrapRef = useRef<HTMLDivElement>(null);
+
+  // --- Stickers (images from links placed anywhere on the page) ---
+  const [stickers, setStickers] = useState<Sticker[]>(() => readLocalSessionItem<Sticker[]>(STICKERS_KEY, []));
+  const [showStickerModal, setShowStickerModal] = useState(false);
+  const [stickerUrl, setStickerUrl] = useState('');
+  const [stickerSize, setStickerSize] = useState(25); // % of page width
+  const [stickerRotate, setStickerRotate] = useState(-3); // degrees
+  const [placingMode, setPlacingMode] = useState(false);
+  const [exportingPdf, setExportingPdf] = useState(false);
+  const [flipDir, setFlipDir] = useState<'next' | 'prev'>('next');
 
   // Check auth state on mount — hardcoded login gate (DeepNectar)
   useEffect(() => {
@@ -529,6 +559,214 @@ function App() {
   const completeDiaryGroups = buildCompleteDiary(filteredEntries);
   const diaryDateRange = dateRangeOf(entries.map((e) => e.dateTime));
 
+  // --- A4 pagination: turn the whole diary into fixed A4 pages ---
+  const charsPerLine = 82;   // approx chars per line at 10pt on a narrow-margin A4
+  const linesPerPageUnit = 56; // approx lines that fit in one full printable page height
+
+  const diaryPages: PageBlock[][] = (() => {
+    const blocks: PageBlock[] = [];
+
+    // Cover page block (title + date range) — always first
+    blocks.push({
+      key: 'cover',
+      heightUnits: 0.3,
+      render: () => (
+        <div style={{ textAlign: 'center', padding: '18mm 0 10mm' }}>
+          <div style={{ fontSize: '34pt', lineHeight: 1 }}>📖</div>
+          <h1 style={{ fontFamily: 'Georgia, serif', fontSize: '18pt', color: '#78350f', margin: '6mm 0 2mm' }}>
+            COMPLETE DIARY
+          </h1>
+          <h2 style={{ fontFamily: 'Georgia, serif', fontSize: '14pt', color: '#9a3412', margin: '0 0 4mm' }}>
+            DEEP &amp; 🫰🫶🏻Chota Don❣️❤️😘
+          </h2>
+          <div style={{ color: '#b45309', letterSpacing: '2px', fontSize: '9pt' }}>========================================</div>
+          <p style={{ marginTop: '4mm', fontSize: '11pt', color: '#78350f' }}>
+            <strong>Date:</strong> {diaryDateRange || 'Date not specified — arranged by context'}
+          </p>
+          <p style={{ fontSize: '9pt', color: '#a16207', marginTop: '2mm' }}>
+            Oldest → newest · grouped under headings · nothing added, nothing removed
+          </p>
+        </div>
+      ),
+    });
+
+    for (const group of completeDiaryGroups) {
+      blocks.push({
+        key: `h-${group.heading}-${blocks.length}`,
+        heightUnits: 0.06,
+        render: () => (
+          <h2 className="pg-heading">
+            <span style={{
+              display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
+              width: '6mm', height: '6mm', borderRadius: '9999px', background: '#d97706',
+              color: '#fff', fontSize: '9pt', marginRight: '2mm',
+            }}>{group.number}</span>
+            {group.heading}
+            <span style={{ fontSize: '8pt', color: '#b45309', marginLeft: '2mm' }}>({group.items.length})</span>
+          </h2>
+        ),
+      });
+
+      for (const entry of group.items) {
+        const msgH = estimateTextHeightUnits(`Message: ${entry.dateTime} - ${entry.senderName}: "${entry.message}"`, charsPerLine, linesPerPageUnit);
+        const feelH = estimateTextHeightUnits(`What I felt: ${entry.reflection}`, charsPerLine - 4, linesPerPageUnit * 1.1);
+        blocks.push({
+          key: `e-${entry.id}`,
+          heightUnits: msgH + feelH + 0.05,
+          render: () => (
+            <div className="pg-entry">
+              <div className="pg-meta">🕐 {entry.dateTime}</div>
+              <div className="pg-msg">
+                <strong style={{ color: '#b45309' }}>Message:</strong>{' '}
+                <strong>{entry.dateTime}</strong> - <strong style={{ color: '#b45309' }}>{entry.senderName}</strong>:{' '}
+                <em>"{entry.message}"</em>
+              </div>
+              <div className="pg-feel">
+                <strong style={{ fontStyle: 'normal', color: '#c2410c' }}>💭 What I felt:</strong> {entry.reflection}
+              </div>
+            </div>
+          ),
+        });
+      }
+    }
+
+    // Final summary block(s)
+    if (filteredEntries.length > 0 && !searchQuery) {
+      const summaryLines = buildSummaryLines(entries);
+      blocks.push({
+        key: 'summary-title',
+        heightUnits: 0.07,
+        render: () => (
+          <h2 className="pg-heading" style={{ textAlign: 'center', borderBottom: '2px solid #f59e0b' }}>
+            📌 FINAL SUMMARY — COMPLETE DIARY
+          </h2>
+        ),
+      });
+      // Split summary into two halves so it can flow across pages naturally
+      const half = Math.ceil(summaryLines.length / 2);
+      const mkList = (lines: string[], k: string): PageBlock => ({
+        key: k,
+        heightUnits: lines.reduce((acc, l) => acc + estimateTextHeightUnits(l, charsPerLine - 4, linesPerPageUnit), 0) + 0.03,
+        render: () => (
+          <ul style={{ listStyle: 'none', padding: 0, margin: '2mm 4mm' }}>
+            {lines.map((l, i) => (
+              <li key={i} style={{ marginBottom: '2.2mm', fontSize: '10pt', color: '#713f12' }}>
+                <span style={{ color: '#f59e0b' }}>•</span> {l}
+              </li>
+            ))}
+          </ul>
+        ),
+      });
+      blocks.push(mkList(summaryLines.slice(0, half), 'sum-1'));
+      blocks.push(mkList(summaryLines.slice(half), 'sum-2'));
+      blocks.push({
+        key: 'sum-end',
+        heightUnits: 0.04,
+        render: () => (
+          <p style={{ textAlign: 'center', color: '#b45309', letterSpacing: '2px', fontSize: '8pt', fontWeight: 700 }}>
+            ========================================
+          </p>
+        ),
+      });
+    }
+
+    return paginateBlocks(blocks);
+  })();
+
+  const totalPages = diaryPages.length;
+
+  // Keep current page in range when content shrinks
+  useEffect(() => {
+    if (currentPage > totalPages - 1) setCurrentPage(Math.max(0, totalPages - 1));
+  }, [totalPages, currentPage]);
+
+  // Persist stickers
+  useEffect(() => {
+    writeLocalSessionItem(STICKERS_KEY, stickers);
+  }, [stickers]);
+
+  // Fit the A4 sheet to the viewport (site shows exactly ONE A4 page at a time)
+  useEffect(() => {
+    const el = sheetWrapRef.current;
+    if (!el) return;
+    const PX_PER_MM = 96 / 25.4;
+    const update = () => {
+      const availW = el.clientWidth;                       // px
+      const availH = window.innerHeight - 230;             // px: header + controls/footer space
+      const s = Math.min(availW / (210 * PX_PER_MM), Math.max(150, availH) / (297 * PX_PER_MM), 1);
+      setSheetScale(s > 0 ? s : 1);
+    };
+    update();
+    window.addEventListener('resize', update);
+    return () => window.removeEventListener('resize', update);
+  }, []);
+
+  // Keyboard page flipping (← / →)
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (showForm || showImportModal || showStickerModal) return;
+      if (e.key === 'ArrowRight') flipTo(currentPage + 1);
+      if (e.key === 'ArrowLeft') flipTo(currentPage - 1);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  });
+
+  function flipTo(target: number) {
+    const t = Math.max(0, Math.min(totalPages - 1, target));
+    if (t === currentPage) return;
+    setFlipDir(t > currentPage ? 'next' : 'prev');
+    setCurrentPage(t);
+  }
+
+  // --- Stickers ---
+  const addStickerAt = (xPct: number, yPct: number) => {
+    const url = stickerUrl.trim();
+    if (!url) return;
+    const s: Sticker = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      url,
+      page: currentPage,
+      xPct: Math.max(2, Math.min(xPct, 98 - stickerSize)),
+      yPct: Math.max(2, Math.min(yPct, 95)),
+      sizePct: stickerSize,
+      rotate: stickerRotate,
+    };
+    setStickers((prev) => [...prev, s]);
+    setPlacingMode(false);
+    setShowStickerModal(false);
+    setStickerUrl('');
+    setImportStatus({ type: 'success', message: 'Sticker added! It will appear in the PDF too.' });
+  };
+
+  const removeSticker = (id: string) => setStickers((prev) => prev.filter((s) => s.id !== id));
+  const moveSticker = (id: string, dxPct: number, dyPct: number) =>
+    setStickers((prev) =>
+      prev.map((s) =>
+        s.id === id
+          ? { ...s, xPct: Math.max(0, Math.min(100 - s.sizePct, s.xPct + dxPct)), yPct: Math.max(0, Math.min(97, s.yPct + dyPct)) }
+          : s
+      )
+    );
+
+  // --- Save as PDF (A4, all pages, with page numbers + stickers) ---
+  const handleSaveAsPdf = async () => {
+    setExportingPdf(true);
+    setShowMenu(false);
+    try {
+      const n = await exportPagesToA4Pdf('.a4-print-area .a4-page', `my-diary-${new Date().toISOString().split('T')[0]}.pdf`);
+      setImportStatus({ type: 'success', message: `Saved PDF with ${n} A4 page${n === 1 ? '' : 's'}!` });
+    } catch (err: any) {
+      setImportStatus({ type: 'error', message: err?.message || 'Failed to export PDF.' });
+    } finally {
+      setExportingPdf(false);
+    }
+  };
+
+  const stickersForCurrentPage = stickers.filter((s) => s.page === currentPage);
+
   // Show loading state
   if (loading) {
     return (
@@ -616,6 +854,17 @@ function App() {
                     <div>
                       <p className="font-medium text-gray-800">Export as Text</p>
                       <p className="text-xs text-gray-500">Readable diary format</p>
+                    </div>
+                  </button>
+                  <button
+                    onClick={handleSaveAsPdf}
+                    disabled={entries.length === 0 || exportingPdf}
+                    className="w-full px-4 py-3 text-left hover:bg-red-50 flex items-center gap-3 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                  >
+                    <span className="text-lg">🖨️</span>
+                    <div>
+                      <p className="font-medium text-gray-800">{exportingPdf ? 'Generating PDF…' : 'Save as PDF (A4)'}</p>
+                      <p className="text-xs text-gray-500">All pages, page numbers, narrow margins</p>
                     </div>
                   </button>
                   <div className="border-t border-amber-100"></div>
@@ -751,6 +1000,81 @@ function App() {
         </div>
       )}
 
+      {/* Sticker Modal — paste an image link, then click anywhere on the A4 page to place it */}
+      {showStickerModal && (
+        <div className="fixed inset-0 z-40 flex items-center justify-center p-4 bg-black/40 backdrop-blur-sm animate-fade-in">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-lg w-full overflow-hidden">
+            <div className="bg-gradient-to-r from-pink-500 to-rose-500 px-6 py-4 flex items-center justify-between">
+              <h2 className="text-white font-semibold text-lg flex items-center gap-2">
+                🌸 Add Image Sticker (Page {currentPage + 1})
+              </h2>
+              <button
+                onClick={() => { setShowStickerModal(false); setPlacingMode(false); }}
+                className="text-white/80 hover:text-white text-xl transition"
+              >
+                ✕
+              </button>
+            </div>
+            <div className="p-6 space-y-5">
+              <p className="text-gray-600 text-sm">
+                Paste a direct image link (ends with .jpg / .png / .gif / .webp…). The sticker is added
+                to the current A4 page and appears in the exported PDF too.
+              </p>
+              <input
+                type="url"
+                value={stickerUrl}
+                onChange={(e) => setStickerUrl(e.target.value)}
+                placeholder="https://example.com/my-photo.jpg"
+                className="w-full px-4 py-3 border border-pink-200 rounded-xl focus:ring-2 focus:ring-pink-400 focus:border-transparent outline-none"
+              />
+              {stickerUrl && (
+                <div className="flex items-center gap-3 bg-pink-50 border border-pink-100 rounded-xl p-3">
+                  <img src={stickerUrl} alt="preview" crossOrigin="anonymous" className="w-16 h-16 object-cover rounded-lg border border-pink-200"
+                       onError={(e) => { (e.currentTarget.style.display = 'none'); }} />
+                  <p className="text-xs text-pink-700">Preview — if it doesn't load here it won't load in the PDF either.</p>
+                </div>
+              )}
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Size: {stickerSize}% of page width</label>
+                  <input type="range" min={10} max={60} value={stickerSize} onChange={(e) => setStickerSize(Number(e.target.value))} className="w-full accent-pink-500" />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 mb-1">Tilt: {stickerRotate}°</label>
+                  <input type="range" min={-20} max={20} value={stickerRotate} onChange={(e) => setStickerRotate(Number(e.target.value))} className="w-full accent-pink-500" />
+                </div>
+              </div>
+              <div className="flex gap-3 pt-2">
+                <button
+                  onClick={() => {
+                    if (!stickerUrl.trim()) return;
+                    setShowStickerModal(false);
+                    setPlacingMode(true);
+                  }}
+                  disabled={!stickerUrl.trim()}
+                  className="flex-1 bg-pink-500 hover:bg-pink-600 disabled:opacity-40 text-white py-3 rounded-xl font-medium transition-all shadow-md"
+                >
+                  🎯 Choose spot on page…
+                </button>
+                <button
+                  onClick={() => addStickerAt(35, 12)}
+                  disabled={!stickerUrl.trim()}
+                  className="flex-1 bg-amber-600 hover:bg-amber-700 disabled:opacity-40 text-white py-3 rounded-xl font-medium transition-all shadow-md"
+                >
+                  ➕ Place in center
+                </button>
+                <button
+                  onClick={() => { setShowStickerModal(false); setPlacingMode(false); }}
+                  className="px-5 py-3 border border-pink-300 text-pink-700 rounded-xl font-medium hover:bg-pink-50 transition-all"
+                >
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       <main className="max-w-4xl mx-auto px-4 py-8">
         {/* Writing Form */}
         {showForm && (
@@ -871,98 +1195,7 @@ function App() {
           </p>
         )}
 
-        {/* 📖 COMPLETE DIARY banner — chronological, grouped under headings */}
-        {entries.length > 0 && (
-          <div className="mb-6 bg-white/70 backdrop-blur-sm rounded-2xl border-2 border-amber-200 p-5 text-center shadow-sm">
-            <p className="text-xs tracking-widest text-amber-500 font-semibold mb-1">========================================</p>
-            <h2 className="text-xl sm:text-2xl font-bold text-amber-900 font-serif">
-              📖 COMPLETE DIARY — DEEP &amp; 🫰🫶🏻CHOTA DON❣️❤️😘
-            </h2>
-            <p className="text-xs tracking-widest text-amber-500 font-semibold mt-1 mb-2">========================================</p>
-            <p className="text-sm text-amber-700">
-              <span className="font-semibold">Date:</span>{' '}
-              {diaryDateRange || 'Date not specified — arranged by context'}
-            </p>
-            <p className="text-xs text-amber-600 mt-1">Oldest → newest · grouped under headings · nothing added, nothing removed</p>
-          </div>
-        )}
-
-        {/* Diary Entries — chronological stream grouped under numbered headings */}
-        <div className="space-y-8">
-          {completeDiaryGroups.map((group) => (
-            <section key={group.heading}>
-              {/* Heading title */}
-              <h2 className="text-lg font-bold text-amber-900 font-serif mb-3 flex items-center gap-2 border-b-2 border-amber-200 pb-2">
-                <span className="text-xs font-bold text-white bg-amber-500 rounded-full w-6 h-6 flex items-center justify-center shrink-0">
-                  {group.number}
-                </span>
-                {group.heading}
-                <span className="text-xs font-normal text-amber-600 bg-amber-100 rounded-full px-2 py-0.5">
-                  {group.items.length}
-                </span>
-              </h2>
-
-              <div className="space-y-5">
-                {group.items.map((entry) => (
-                  <div
-                    key={entry.id}
-                    className="bg-white rounded-2xl shadow-md border border-amber-100 overflow-hidden hover:shadow-lg transition-shadow group"
-                  >
-                    {/* Entry Header */}
-                    <div className="px-6 pt-5 pb-3 border-b border-amber-50">
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-2 text-sm text-amber-600">
-                          <span>🕐</span>
-                          <span className="font-medium">{entry.dateTime}</span>
-                        </div>
-                        <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                          <button
-                            onClick={() => handleEdit(entry)}
-                            className="p-1.5 text-amber-500 hover:text-amber-700 hover:bg-amber-100 rounded-lg transition"
-                            title="Edit"
-                          >
-                            ✏️
-                          </button>
-                          <button
-                            onClick={() => handleDelete(entry.id)}
-                            className="p-1.5 text-red-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition"
-                            title="Delete"
-                          >
-                            🗑️
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Entry Content */}
-                    <div className="px-6 py-4">
-                      {/* Message */}
-                      <div className="mb-4">
-                        <p className="text-gray-800 leading-relaxed">
-                          <span className="text-amber-700 font-semibold">Message:</span>{' '}
-                          <span className="text-amber-900 font-medium">{entry.dateTime}</span>
-                          {' - '}
-                          <span className="text-amber-700 font-medium">{entry.senderName}</span>
-                          : "<span className="italic">{entry.message}</span>"
-                        </p>
-                      </div>
-
-                      {/* Reflection */}
-                      <div className="bg-gradient-to-r from-amber-50 to-orange-50 rounded-xl p-4 border border-amber-100">
-                        <p className="text-gray-700 leading-relaxed">
-                          <span className="text-orange-600 font-semibold">💭 What I felt:</span>{' '}
-                          <span className="italic">{entry.reflection}</span>
-                        </p>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </section>
-          ))}
-        </div>
-
-        {/* Empty State */}
+        {/* Empty state */}
         {entries.length === 0 && !showForm && (
           <div className="text-center py-20">
             <div className="text-6xl mb-4">📔</div>
@@ -985,36 +1218,158 @@ function App() {
           </div>
         )}
 
-        {/* No Results */}
+        {/* ===== A4 BOOK VIEW — one A4 page at a time, flip to navigate ===== */}
+        {entries.length > 0 && (
+          <>
+            {/* Toolbar above the sheet */}
+            <div className="flex flex-wrap items-center justify-center gap-2 mb-4">
+              <button
+                onClick={handleSaveAsPdf}
+                disabled={exportingPdf}
+                className="bg-red-600 hover:bg-red-700 disabled:opacity-60 text-white px-5 py-2.5 rounded-full font-medium transition-all shadow-md hover:shadow-lg flex items-center gap-2"
+                title="Save the whole diary as an A4-sized PDF"
+              >
+                {exportingPdf ? (
+                  <span className="animate-pulse">⏳ Generating PDF ({totalPages} pages)...</span>
+                ) : (
+                  <>🖨️ Save as PDF (A4)</>
+                )}
+              </button>
+              <button
+                onClick={() => { setShowStickerModal(true); setPlacingMode(false); }}
+                className="bg-pink-500 hover:bg-pink-600 text-white px-5 py-2.5 rounded-full font-medium transition-all shadow-md hover:shadow-lg flex items-center gap-2"
+                title="Add an image sticker from a link anywhere on the page"
+              >
+                🌸 Add Image Sticker
+              </button>
+              {stickers.length > 0 && (
+                <button
+                  onClick={() => { if (window.confirm('Remove all stickers from every page?')) setStickers([]); }}
+                  className="border border-red-300 text-red-600 hover:bg-red-50 px-4 py-2.5 rounded-full text-sm font-medium transition"
+                >
+                  🧹 Clear stickers ({stickers.length})
+                </button>
+              )}
+            </div>
+
+            {/* The single visible A4 sheet */}
+            <div ref={sheetWrapRef} className="w-full flex justify-center">
+              <div
+                className="a4-sheet"
+                style={{ height: `${297 * sheetScale}mm` }}
+                onClick={(e) => {
+                  if (!placingMode) return;
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  const xPct = ((e.clientX - rect.left) / rect.width) * 100;
+                  const yPct = ((e.clientY - rect.top) / rect.height) * 100;
+                  addStickerAt(xPct, yPct);
+                }}
+              >
+                <div
+                  key={currentPage}
+                  className={`a4-page page-flip-enter ${placingMode ? 'cursor-crosshair ring-4 ring-pink-400' : ''}`}
+                  style={{
+                    transform: `scale(${sheetScale})`,
+                    ['--flip-from' as any]: flipDir === 'next' ? '45%' : '-45%',
+                  }}
+                >
+                  <div className="a4-print-area">{diaryPages[currentPage].map((b) => <div key={b.key}>{b.render()}</div>)}</div>
+
+                  {/* Stickers pinned to this page */}
+                  {stickersForCurrentPage.map((s) => (
+                    <div
+                      key={s.id}
+                      className="diary-sticker"
+                      style={{ left: `${s.xPct}%`, top: `${s.yPct}%`, width: `${s.sizePct}%`, transform: `rotate(${s.rotate}deg)` }}
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      <img src={s.url} alt="sticker" crossOrigin="anonymous" draggable={false} />
+                      <button className="sticker-remove" title="Remove sticker" onClick={(e) => { e.stopPropagation(); removeSticker(s.id); }}>✕</button>
+                      {/* Nudge controls (appear on hover via CSS) */}
+                      <div className="sticker-nudges">
+                        <button title="Move left" onClick={(e) => { e.stopPropagation(); moveSticker(s.id, -3, 0); }}>◀</button>
+                        <button title="Move up" onClick={(e) => { e.stopPropagation(); moveSticker(s.id, 0, -3); }}>▲</button>
+                        <button title="Move down" onClick={(e) => { e.stopPropagation(); moveSticker(s.id, 0, 3); }}>▼</button>
+                        <button title="Move right" onClick={(e) => { e.stopPropagation(); moveSticker(s.id, 3, 0); }}>▶</button>
+                        <button title="Bigger" onClick={(e) => { e.stopPropagation(); setStickers((prev) => prev.map((x) => x.id === s.id ? { ...x, sizePct: Math.min(60, x.sizePct + 4) } : x)); }}>＋</button>
+                        <button title="Smaller" onClick={(e) => { e.stopPropagation(); setStickers((prev) => prev.map((x) => x.id === s.id ? { ...x, sizePct: Math.max(8, x.sizePct - 4) } : x)); }}>－</button>
+                      </div>
+                    </div>
+                  ))}
+
+                  {/* Page number — bottom-right corner */}
+                  <div className="a4-page-number">Page {currentPage + 1} of {totalPages}</div>
+                </div>
+              </div>
+            </div>
+
+            {placingMode && (
+              <p className="text-center text-pink-600 font-medium mt-3 animate-pulse">
+                🎯 Click anywhere on the A4 page to place your sticker!
+              </p>
+            )}
+
+            {/* Page flip controls */}
+            <div className="flex items-center justify-center gap-4 mt-5 mb-2">
+              <button
+                onClick={() => flipTo(currentPage - 1)}
+                disabled={currentPage === 0}
+                className="bg-amber-600 hover:bg-amber-700 disabled:opacity-30 disabled:cursor-not-allowed text-white px-6 py-2.5 rounded-full font-medium transition-all shadow-md flex items-center gap-2"
+              >
+                ⬅️ Prev
+              </button>
+              <div className="text-amber-800 font-serif font-semibold">
+                Page {currentPage + 1} / {totalPages}
+              </div>
+              <button
+                onClick={() => flipTo(currentPage + 1)}
+                disabled={currentPage >= totalPages - 1}
+                className="bg-amber-600 hover:bg-amber-700 disabled:opacity-30 disabled:cursor-not-allowed text-white px-6 py-2.5 rounded-full font-medium transition-all shadow-md flex items-center gap-2"
+              >
+                Next ➡️
+              </button>
+            </div>
+            <p className="text-center text-xs text-amber-600 mb-4">
+              Tip: use ← / → arrow keys to flip pages · A4 size · narrow margins
+            </p>
+          </>
+        )}
+
+        {/* No search results */}
         {entries.length > 0 && filteredEntries.length === 0 && searchQuery && (
           <div className="text-center py-12">
             <div className="text-4xl mb-3">🔍</div>
             <p className="text-amber-700">No entries found matching "{searchQuery}"</p>
           </div>
         )}
-
-        {/* 📌 FINAL SUMMARY — shown after all reorganized entries */}
-        {filteredEntries.length > 0 && !searchQuery && (
-          <section className="mt-10 bg-gradient-to-r from-amber-50 to-orange-50 rounded-2xl border-2 border-amber-200 p-6 shadow-sm">
-            <h2 className="text-lg font-bold text-amber-900 font-serif mb-3 text-center">
-              📌 FINAL SUMMARY — COMPLETE DIARY
-            </h2>
-            <ul className="space-y-2 text-sm text-amber-800 leading-relaxed max-w-2xl mx-auto">
-              {buildSummaryLines(entries).map((line, i) => (
-                <li key={i} className="flex gap-2">
-                  <span className="text-amber-400">•</span>
-                  <span>{line}</span>
-                </li>
-              ))}
-            </ul>
-            <p className="text-center text-xs tracking-widest text-amber-500 font-semibold mt-4">========================================</p>
-          </section>
-        )}
       </main>
+
+      {/* Hidden full-size A4 pages used ONLY for PDF export (all pages, stickers, page numbers) */}
+      {entries.length > 0 && (
+        <div style={{ position: 'absolute', left: -99999, top: 0, width: '210mm' }} aria-hidden="true">
+          {diaryPages.map((pageBlocks, idx) => (
+            <div key={`print-${idx}`} className="a4-page" style={{ transform: 'none' }}>
+              <div className="a4-print-area">
+                {pageBlocks.map((b) => <div key={b.key}>{b.render()}</div>)}
+              </div>
+              {stickers.filter((s) => s.page === idx).map((s) => (
+                <div
+                  key={`print-sticker-${s.id}`}
+                  className="diary-sticker"
+                  style={{ left: `${s.xPct}%`, top: `${s.yPct}%`, width: `${s.sizePct}%`, transform: `rotate(${s.rotate}deg)` }}
+                >
+                  <img src={s.url} alt="sticker" crossOrigin="anonymous" draggable={false} />
+                </div>
+              ))}
+              <div className="a4-page-number">Page {idx + 1} of {totalPages}</div>
+            </div>
+          ))}
+        </div>
+      )}
 
       {/* Footer */}
       <footer className="text-center py-6 text-amber-600 text-sm">
-        <p>Your diary entries are synced to the cloud ☁️ 🔒</p>
+        <p>Your diary entries are synced to the cloud ☁️ 🔒 · A4 pages · narrow margins</p>
       </footer>
     </div>
   );

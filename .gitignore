@@ -1,10 +1,2 @@
-node_modules/
-.next/
 dist/
-build/
-*.log
-
-# Local environment variables
-.env
-.env.*
-!.env.example
+.env.local

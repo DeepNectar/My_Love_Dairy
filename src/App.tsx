@@ -370,20 +370,34 @@ function App() {
               <div className="space-y-3">
                 <div className="flex items-start gap-3 p-3 bg-amber-50 rounded-xl border border-amber-100">
                   <span className="text-xl">📋</span>
-                  <div>
+                  <div className="flex-1">
                     <p className="font-medium text-amber-900">JSON Format</p>
                     <p className="text-sm text-amber-700">Full backup files with all entry data including IDs and timestamps.</p>
+                    <a
+                      href="/templates/diary-template.json"
+                      download="diary-template.json"
+                      className="inline-flex items-center gap-1.5 mt-2 text-xs font-medium text-amber-600 hover:text-amber-800 bg-amber-100 hover:bg-amber-200 px-3 py-1.5 rounded-lg transition-colors"
+                    >
+                      ⬇️ Download JSON Template
+                    </a>
                   </div>
                 </div>
                 <div className="flex items-start gap-3 p-3 bg-orange-50 rounded-xl border border-orange-100">
                   <span className="text-xl">📝</span>
-                  <div>
+                  <div className="flex-1">
                     <p className="font-medium text-orange-900">Text Format (.txt / .md)</p>
                     <p className="text-sm text-orange-700">Entries in the diary format:</p>
                     <code className="text-xs bg-orange-100 px-2 py-1 rounded mt-1 block text-orange-800">
                       Message: [Date] - [Name]: "content"<br/>
                       What I felt: [reflection]
                     </code>
+                    <a
+                      href="/templates/diary-template.txt"
+                      download="diary-template.txt"
+                      className="inline-flex items-center gap-1.5 mt-2 text-xs font-medium text-orange-600 hover:text-orange-800 bg-orange-100 hover:bg-orange-200 px-3 py-1.5 rounded-lg transition-colors"
+                    >
+                      ⬇️ Download Text Template
+                    </a>
                   </div>
                 </div>
               </div>

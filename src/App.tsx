@@ -11,7 +11,7 @@ import {
 } from './lib/headings';
 import { FIXED_USER_ID, ensureSupabaseSession } from './lib/hardcodedAuth';
 import { readLocalSession, clearLocalSession, writeLocalSessionItem, readLocalSessionItem } from './lib/localSession';
-import { exportDiaryToA4Pdf, CONTENT_W_CSS, CSS_PX_PER_MM, computeAvailableFlowHeightCss } from './lib/pdfExport';
+import { exportDiaryToA4Pdf, CONTENT_W_CSS, CSS_PX_PER_MM, computeAvailableFlowHeightCss, resolveStickerPlacements } from './lib/pdfExport';
 import { resolveImageUrl, loadDataUrlCached, RobustImg } from './lib/images';
 import { LoveStoryHeader, LoveStoryFooter } from './lib/loveStory';
 
@@ -30,18 +30,24 @@ function printClone(node: HTMLElement): HTMLElement {
   return c;
 }
 
-// Sticker: an image (from a link) placed anywhere on an A4 page.
+/** Sticker: an image (from a link) placed on the A4 pages.
+ *  page = -2 → scattered randomly across ALL pages (recommended mode),
+ *  page = -1 → one random page, page ≥ 0 → pinned to that page. */
 interface Sticker {
   id: string;
   url: string;
-  page: number;   // 0-based page index it is pinned to
-  xPct: number;   // horizontal position as % of page width
-  yPct: number;   // vertical position as % of page height
+  page: number;   // see above
+  xPct?: number;  // horizontal position as % of page width (undefined → random)
+  yPct?: number;  // vertical position as % of page height (undefined → random)
   sizePct: number; // width as % of page width
   rotate: number;  // degrees
 }
 
 const STICKERS_KEY = 'diary_stickers_v1';
+
+/** A4 sheet geometry shared by the preview and the PDF exporter (see pdfExport.ts). */
+const SHEET_ASPECT_MM = 297 / 210;   // height / width of an A4 sheet
+const STICKER_MAX_Y_PCT = 86;        // never cover the signatures / page number
 
 interface DiaryEntry {
   id: string;
@@ -850,24 +856,36 @@ function App() {
   }
 
   // --- Stickers ---
-  const addStickerAt = (xPct: number, yPct: number) => {
+  /**
+   * Add a sticker from an image link (Google Drive share links work too).
+   * `page: undefined` → the sticker is scattered RANDOMLY across ALL pages
+   * (one copy per page, deterministic positions shared by preview + PDF).
+   * `page: -1`       → one random page.
+   * `page: n`        → pinned to that page at (xPct, yPct).
+   */
+  const addStickerAt = (opts: { page?: number; xPct?: number; yPct?: number }) => {
     const raw = stickerUrl.trim();
     if (!raw) return;
     const url = resolveImageUrl(raw); // Google Drive share links → embeddable image URLs
     const s: Sticker = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
       url,
-      page: currentPage,
-      xPct: Math.max(2, Math.min(xPct, 98 - stickerSize)),
-      yPct: Math.max(2, Math.min(yPct, 95)),
-      sizePct: stickerSize,
+      page: opts.page ?? -2, // -2 = "all pages, random spots" (see resolveStickerPlacements)
+      xPct: opts.xPct !== undefined ? Math.max(2, Math.min(opts.xPct, 98 - stickerSize)) : undefined,
+      yPct: opts.yPct !== undefined ? Math.max(2, Math.min(opts.yPct, 95)) : undefined,
+      sizePct: opts.page === undefined ? Math.min(stickerSize, 14) : stickerSize,
       rotate: stickerRotate,
     };
     setStickers((prev) => [...prev, s]);
     setPlacingMode(false);
     setShowStickerModal(false);
     setStickerUrl('');
-    setImportStatus({ type: 'success', message: 'Sticker added! It will appear in the PDF too.' });
+    setImportStatus({
+      type: 'success',
+      message: opts.page === undefined
+        ? 'Sticker added randomly to ALL pages — it will appear in the PDF too! 💕'
+        : 'Sticker added! It will appear in the PDF too.',
+    });
   };
 
   const removeSticker = (id: string) => setStickers((prev) => prev.filter((s) => s.id !== id));

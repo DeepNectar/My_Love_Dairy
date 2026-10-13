@@ -45,13 +45,63 @@ npm install
 Go to **SQL Editor** in your Supabase dashboard and run this SQL:
 
 ```sql
--- Enable UUID extension
+-- ============================================================
+-- 📖 My Diary — Supabase SQL (run in SQL Editor to go live)
+-- Format:  #### HEADING N: [Topic Name]
+--          - Message: [Date & Time] - [Sender]: "[Message]"
+--            What I felt: [Reflection]
+-- ============================================================
+
+-- 1) Extensions
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
--- Create diary_entries table
-CREATE TABLE diary_entries (
+-- 2) Heading categories reference table (the 15 allowed headings)
+CREATE TABLE IF NOT EXISTS heading_categories (
+  id SERIAL PRIMARY KEY,
+  emoji TEXT NOT NULL,
+  title TEXT NOT NULL UNIQUE,
+  when_to_use TEXT NOT NULL,
+  only_if_mentioned BOOLEAN NOT NULL DEFAULT FALSE,
+  sort_order INT NOT NULL DEFAULT 0
+);
+
+-- Full heading text = emoji || ' ' || title  e.g. '🌅 Morning & Night Greetings'
+INSERT INTO heading_categories (emoji, title, when_to_use, only_if_mentioned, sort_order) VALUES
+  ('🌅', 'Morning & Night Greetings',        'For good mornings/nights',               FALSE, 1),
+  ('💬', 'Daily Life & Important Updates',   'For daily conversations',                FALSE, 2),
+  ('💖', 'Sweet Compliments & Love',         'For loving words',                       FALSE, 3),
+  ('👨‍👩‍👧‍👦', 'About Kesha (Her Sister)',       'ONLY if mentioned',                      TRUE,  4),
+  ('👨‍👩‍👧‍👦', 'About Arya (Her Brother)',       'ONLY if mentioned',                      TRUE,  5),
+  ('🎯', 'Dreams & Future Plans',            'For future goals',                       FALSE, 6),
+  ('🤗', 'Emotional Support & Care',         'For emotional talks',                    FALSE, 7),
+  ('😄', 'Fun Moments & Jokes',              'For funny moments',                      FALSE, 8),
+  ('🔥', 'Flirty Banter & Teasing',          'For flirty exchanges',                   FALSE, 9),
+  ('💕', 'Romantic Confessions',             'For romantic declarations',              FALSE, 10),
+  ('💘', 'Attraction & Desire',              'For attraction talks',                   FALSE, 11),
+  ('🌙', 'Intimate & Passionate Talks',      'For intimate moments',                   FALSE, 12),
+  ('💝', 'Deep Chemistry & Connection',      'For deep connection',                    FALSE, 13),
+  ('💭', 'My Messages To Her (No Reply Yet)','For Deep''s messages without reply',     FALSE, 14),
+  ('💌', 'Her Messages To Me',               'For her messages without Deep''s reply', FALSE, 15)
+ON CONFLICT (title) DO UPDATE SET
+  emoji = EXCLUDED.emoji,
+  when_to_use = EXCLUDED.when_to_use,
+  only_if_mentioned = EXCLUDED.only_if_mentioned,
+  sort_order = EXCLUDED.sort_order;
+
+-- Everyone (signed-in users) can read the heading list; only service role can modify it
+ALTER TABLE heading_categories ENABLE ROW LEVEL SECURITY;
+
+DROP POLICY IF EXISTS "Headings are readable by authenticated users" ON heading_categories;
+CREATE POLICY "Headings are readable by authenticated users"
+  ON heading_categories FOR SELECT
+  TO authenticated
+  USING (TRUE);
+
+-- 3) Diary entries table (adds the heading column)
+CREATE TABLE IF NOT EXISTS diary_entries (
   id UUID DEFAULT uuid_generate_v4() PRIMARY KEY,
   user_id UUID REFERENCES auth.users(id) ON DELETE CASCADE NOT NULL,
+  heading TEXT NOT NULL DEFAULT '💬 Daily Life & Important Updates',
   date_time TEXT NOT NULL,
   sender_name TEXT NOT NULL,
   message TEXT NOT NULL,
@@ -60,31 +110,37 @@ CREATE TABLE diary_entries (
   updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Create indexes for faster queries
-CREATE INDEX idx_diary_entries_user_id ON diary_entries(user_id);
-CREATE INDEX idx_diary_entries_created_at ON diary_entries(created_at DESC);
+-- If you already have the OLD diary_entries table (without heading), run this instead:
+-- ALTER TABLE diary_entries ADD COLUMN IF NOT EXISTS heading TEXT NOT NULL DEFAULT '💬 Daily Life & Important Updates';
 
--- Enable Row Level Security
+CREATE INDEX IF NOT EXISTS idx_diary_entries_user_id ON diary_entries(user_id);
+CREATE INDEX IF NOT EXISTS idx_diary_entries_created_at ON diary_entries(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_diary_entries_heading ON diary_entries(user_id, heading);
+
+-- 4) Row Level Security on diary_entries
 ALTER TABLE diary_entries ENABLE ROW LEVEL SECURITY;
 
--- Security Policies
+DROP POLICY IF EXISTS "Users can view own entries" ON diary_entries;
 CREATE POLICY "Users can view own entries"
   ON diary_entries FOR SELECT
   USING (auth.uid() = user_id);
 
+DROP POLICY IF EXISTS "Users can insert own entries" ON diary_entries;
 CREATE POLICY "Users can insert own entries"
   ON diary_entries FOR INSERT
   WITH CHECK (auth.uid() = user_id);
 
+DROP POLICY IF EXISTS "Users can update own entries" ON diary_entries;
 CREATE POLICY "Users can update own entries"
   ON diary_entries FOR UPDATE
   USING (auth.uid() = user_id);
 
+DROP POLICY IF EXISTS "Users can delete own entries" ON diary_entries;
 CREATE POLICY "Users can delete own entries"
   ON diary_entries FOR DELETE
   USING (auth.uid() = user_id);
 
--- Auto-update timestamp trigger
+-- 5) Auto-update timestamp trigger
 CREATE OR REPLACE FUNCTION update_updated_at_column()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -93,10 +149,13 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS update_diary_entries_updated_at ON diary_entries;
 CREATE TRIGGER update_diary_entries_updated_at
   BEFORE UPDATE ON diary_entries
   FOR EACH ROW
   EXECUTE FUNCTION update_updated_at_column();
+
+-- Done ✅ — the app's dropdown/export/import templates use exactly these 15 headings.
 ```
 
 ### 3. Configure Environment Variables
@@ -128,20 +187,41 @@ Open [http://localhost:5173](http://localhost:5173) in your browser.
 3. Check your email to verify your account (if email confirmation is enabled)
 4. Log in and start writing!
 
-## 📝 Entry Format
+## 📝 Entry Format (Heading Template)
 
-Each diary entry follows this structure:
+Entries are grouped under one of 15 fixed headings. Download template files use this structure:
 
 ```
-Message: [Date & Time] - [Sender Name]: "[Message content]"
-What I felt: [Original reflection]
+#### HEADING 1: [Topic Name]
+
+- Message: [Date & Time] - Deep: "[Message content]"
+  What I felt: [Original reflection]
+
+- Message: [Date & Time] - 🫰🫶🏻Chota Don❣️❤️😘: "[Message content]"
+  What I felt: [Original reflection]
 ```
 
-Example:
-```
-Message: January 15, 2026, 10:30 AM - John: "Today I had a wonderful conversation with an old friend."
-What I felt: I felt grateful for the connection and reminded of the importance of friendships.
-```
+### All Headings & When To Use
+
+| Heading | When to Use |
+|---------|-------------|
+| 🌅 Morning & Night Greetings | For good mornings/nights |
+| 💬 Daily Life & Important Updates | For daily conversations |
+| 💖 Sweet Compliments & Love | For loving words |
+| 👨‍👩‍👧‍👦 About Kesha (Her Sister) | ONLY if mentioned |
+| 👨‍👩‍👧‍👦 About Arya (Her Brother) | ONLY if mentioned |
+| 🎯 Dreams & Future Plans | For future goals |
+| 🤗 Emotional Support & Care | For emotional talks |
+| 😄 Fun Moments & Jokes | For funny moments |
+| 🔥 Flirty Banter & Teasing | For flirty exchanges |
+| 💕 Romantic Confessions | For romantic declarations |
+| 💘 Attraction & Desire | For attraction talks |
+| 🌙 Intimate & Passionate Talks | For intimate moments |
+| 💝 Deep Chemistry & Connection | For deep connection |
+| 💭 My Messages To Her (No Reply Yet) | For Deep's messages without reply |
+| 💌 Her Messages To Me | For her messages without Deep's reply |
+
+The same list is seeded into the `heading_categories` table in Supabase, shown in the app's New Entry dropdown, printed inside the Import modal, and used when exporting text backups.
 
 ## 📥 Import/Export
 
@@ -159,8 +239,8 @@ Click the menu (☰) button and choose:
 4. Choose the file to import
 
 **Supported formats:**
-- `.json` - Full backup files
-- `.txt` / `.md` - Text format files
+- `.json` - Full backup files (entries include a `heading` field)
+- `.txt` / `.md` - Heading-template format (`#### HEADING N:` + `- Message:` bullets); legacy plain format still works
 
 Templates are available for download in the import modal.
 

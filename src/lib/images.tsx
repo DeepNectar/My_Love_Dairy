@@ -160,6 +160,14 @@ export function RobustImg({
   return (
     <img
       src={current}
+      // Normalized srcset: every candidate is flagged with its REAL pixel
+      // width instead of advertising one giant size for all of them. The old
+      // "1400w"-style srcsets made the browser pick a resolution that ignored
+      // the CSS box, so header photos / signatures rendered at odd sizes and
+      // overflowed their bands in the PDF. With correct descriptors the img
+      // always fits the width/height given by CSS (object-fit stays honest).
+      srcSet={candidates.map((c, i) => `${c} ${Math.round(widthHint * Math.pow(2, i))}w`).join(', ')}
+      sizes="100vw"
       alt={alt}
       crossOrigin="anonymous"
       draggable={draggable}

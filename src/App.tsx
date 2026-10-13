@@ -961,12 +961,17 @@ function App() {
       }
 
       // ---- FALLBACK PATH: off-screen blocks + stamped header/footer bands --
+      // Stickers are handed to the exporter too (same deterministic scatter as
+      // the preview), so even when the live-sheet path is unavailable the PDF
+      // still gets the photo in the header, signatures in the footer AND all
+      // stickers on the pages.
       const n = await exportDiaryToA4Pdf({
         blocksSelector: '#pdf-blocks',
         bands: [
           { nodeId: 'ls-header-print', position: 'top' },
           { nodeId: 'ls-footer-print', position: 'bottom' },
         ],
+        stickers: stickers.map((s) => stickerToPdf(s, Math.max(flowPages.length, 1))),
         // Rasterize clean clones (no hover/nudge buttons) so the PDF shows
         // exactly the visual preview of each page.
         prepareNode: printClone,

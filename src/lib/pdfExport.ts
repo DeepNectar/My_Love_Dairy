@@ -215,6 +215,41 @@ async function inlineImages(root: HTMLElement) {
   );
 }
 
+/**
+ * Pin each image's DRAWN size to the exact box it occupies on the live page
+ * before rasterizing. The header photo and both signatures are laid out by
+ * CSS (32mm square / up to 62×17mm), but once their src becomes a data URL
+ * inside the SVG snapshot they lose access to the stylesheet's flex sizing —
+ * they would then paint at intrinsic pixel size and blow the bands apart
+ * ("photo/signature not fitting in header & footer"). Reading offsetWidth/
+ * Height from the ORIGINAL nodes (still mounted, still CSS-sized) and writing
+ * those numbers as inline styles onto the clone guarantees the images fit the
+ * header and footer perfectly in the exported PDF, exactly like the preview.
+ */
+function pinImageSizes(node: HTMLElement, clone: HTMLElement): void {
+  const origImgs = Array.from(node.querySelectorAll('img'));
+  const cloneImgs = Array.from(clone.querySelectorAll('img'));
+  const n = Math.min(origImgs.length, cloneImgs.length);
+  for (let i = 0; i < n; i++) {
+    const o = origImgs[i];
+    const c = cloneImgs[i];
+    const w = o.offsetWidth || o.clientWidth || Number(o.getAttribute('width')) || 0;
+    const h = o.offsetHeight || o.clientHeight || Number(o.getAttribute('height')) || 0;
+    if (w > 0) {
+      c.style.width = `${Math.round(w)}px`;
+      c.style.maxWidth = `${Math.round(w)}px`;
+    }
+    if (h > 0) {
+      c.style.height = `${Math.round(h)}px`;
+      c.style.maxHeight = `${Math.round(h)}px`;
+    }
+    // Keep the visual crop behaviour the site shows (cover for the header
+    // photo, contain for the signatures) instead of stretching.
+    const fit = getComputedStyle(o).objectFit;
+    if (fit) c.style.objectFit = fit;
+  }
+}
+
 function measureBlocks(container: HTMLElement): MeasuredBlock[] {
   const out: MeasuredBlock[] = [];
   for (const child of Array.from(container.children) as HTMLElement[]) {
@@ -371,6 +406,8 @@ async function rasterizeNode(
   // Give the caller a chance to clean the snapshot (strip UI-only chrome).
   const rawClone = opts?.prepare ? opts.prepare(el) : (el.cloneNode(true) as HTMLElement);
   const clone = rawClone;
+  // Header photo / signatures must keep their on-page box size in the PDF.
+  pinImageSizes(el, clone);
   clone.style.width = `${widthCss}px`;
   if (isSlice) {
     // Slice wrapper: keep the fixed-height clipping window EXACTLY as the
@@ -564,6 +601,11 @@ export async function renderSheetNode(
   try {
     const rawClone = opts?.prepare ? opts.prepare(node) : (node.cloneNode(true) as HTMLElement);
     const clone = rawClone;
+    // Freeze the header photo & both signatures at EXACTLY the box size they
+    // occupy on the visible preview sheet — this is what makes them "fit
+    // properly in the header and in the footer" in the exported PDF instead
+    // of painting at their huge intrinsic pixel size.
+    pinImageSizes(node, clone);
     clone.style.width = `${SHEET_PX_W}px`;
     clone.style.height = `${SHEET_PX_H}px`;
     clone.style.boxSizing = 'border-box';
@@ -762,11 +804,6 @@ export async function exportDiaryToA4Pdf(opts: PdfOptions): Promise<number> {
       await wait(0);
     }
 
-    if (bottomBand) {
-      const by = (SHEET_H_CSS - MARGIN_CSS - bottomBand.heightCss) * S;
-      ctx.drawImage(bottomBand.canvas, MARGIN_CSS * S, by, CONTENT_W_CSS * S, bottomBand.heightCss * S);
-    }
-
     // Stickers for this sheet — drawn ON TOP of everything, exactly like the
     // preview. The bottom-right corner stays free so a sticker can never hide
     // the "Page N of M" stamp.
@@ -780,6 +817,12 @@ export async function exportDiaryToA4Pdf(opts: PdfOptions): Promise<number> {
         p.xPct < ((pnBoxX + wPx) / SHEET_W_CSS) * 100 &&
         p.yPct < ((pnBoxY + hPx) / SHEET_H_CSS) * 100;
       if (!overlapsPageNumber) drawStickerOnSheet(ctx, img, p);
+    }
+
+    // Footer band painted LAST so stickers can never cover the signatures.
+    if (bottomBand) {
+      const by = (SHEET_H_CSS - MARGIN_CSS - bottomBand.heightCss) * S;
+      ctx.drawImage(bottomBand.canvas, MARGIN_CSS * S, by, CONTENT_W_CSS * S, bottomBand.heightCss * S);
     }
 
     // Page number — bottom-right corner of every A4 sheet

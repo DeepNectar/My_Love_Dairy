@@ -12,7 +12,7 @@ import {
 import { FIXED_USER_ID, ensureSupabaseSession } from './lib/hardcodedAuth';
 import { readLocalSession, clearLocalSession, writeLocalSessionItem, readLocalSessionItem } from './lib/localSession';
 import { exportDiaryToA4Pdf, CONTENT_W_CSS } from './lib/pdfExport';
-import { resolveImageUrl, loadDataUrlCached } from './lib/images';
+import { resolveImageUrl, loadDataUrlCached, RobustImg } from './lib/images';
 import { LoveStoryHeader, LoveStoryFooter } from './lib/loveStory';
 
 /** CSS px per mm at 96dpi — the sheet is laid out in real millimetres. */
@@ -1080,8 +1080,7 @@ function App() {
               />
               {stickerUrl && (
                 <div className="flex items-center gap-3 bg-pink-50 border border-pink-100 rounded-xl p-3">
-                  <img src={stickerUrl} alt="preview" crossOrigin="anonymous" className="w-16 h-16 object-cover rounded-lg border border-pink-200"
-                       onError={(e) => { (e.currentTarget.style.display = 'none'); }} />
+                  <RobustImg src={resolveImageUrl(stickerUrl)} alt="preview" className="w-16 h-16 object-cover rounded-lg border border-pink-200" />
                   <p className="text-xs text-pink-700">Preview — if it doesn't load here it won't load in the PDF either.</p>
                 </div>
               )}
@@ -1344,7 +1343,7 @@ function App() {
                       style={{ left: `${s.xPct}%`, top: `${s.yPct}%`, width: `${s.sizePct}%`, transform: `rotate(${s.rotate}deg)` }}
                       onClick={(e) => e.stopPropagation()}
                     >
-                      <img src={s.url} alt="sticker" crossOrigin="anonymous" draggable={false} />
+                      <RobustImg src={s.url} alt="sticker" draggable={false} />
                       <button className="sticker-remove" title="Remove sticker" onClick={(e) => { e.stopPropagation(); removeSticker(s.id); }}>✕</button>
                       {/* Nudge controls (appear on hover via CSS) */}
                       <div className="sticker-nudges">
@@ -1442,7 +1441,7 @@ function App() {
                     key={`p-sticker-${s.id}`}
                     style={{ width: `${(s.sizePct / 100) * CONTENT_W_CSS}px`, margin: '4px auto', transform: `rotate(${s.rotate}deg)` }}
                   >
-                    <img src={s.url} alt="sticker" draggable={false} style={{ width: '100%', display: 'block', border: '3px solid #fff', borderRadius: '8px' }} />
+                    <RobustImg src={s.url} alt="sticker" draggable={false} style={{ width: '100%', display: 'block', border: '3px solid #fff', borderRadius: '8px' }} />
                   </div>
                 ))}
               </div>

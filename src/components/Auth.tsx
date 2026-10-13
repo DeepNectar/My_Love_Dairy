@@ -27,12 +27,18 @@ export default function Auth({ onAuthSuccess }: AuthProps) {
           email,
           password,
         });
-        if (error) throw error;
+        if (error) {
+          // Friendlier message for the common "signed up but never confirmed email" case
+          if (error.message && error.message.toLowerCase().includes('email not confirmed')) {
+            throw new Error('Please confirm your email address first (check your inbox), then log in.');
+          }
+          throw error;
+        }
         setMessage('Logged in successfully!');
         setTimeout(() => onAuthSuccess(), 500);
       } else {
         // Sign up
-        const { error } = await supabase.auth.signUp({
+        const { data, error } = await supabase.auth.signUp({
           email,
           password,
           options: {
@@ -42,8 +48,14 @@ export default function Auth({ onAuthSuccess }: AuthProps) {
           },
         });
         if (error) throw error;
-        setMessage('Account created! Please check your email to verify your account, then log in.');
-        setIsLogin(true);
+        if (data.session) {
+          // Email confirmation is disabled — user is logged in immediately
+          setMessage('Account created! Redirecting...');
+          setTimeout(() => onAuthSuccess(), 500);
+        } else {
+          setMessage('Account created! Please check your email to verify your account, then log in.');
+          setIsLogin(true);
+        }
       }
     } catch (err: any) {
       setError(err.message || 'An error occurred');

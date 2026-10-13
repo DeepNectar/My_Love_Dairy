@@ -62,20 +62,13 @@ function App() {
   }, []);
 
   const handleAuthSuccess = async () => {
-    try {
-      // Real Supabase login behind the scenes → RLS policies will pass.
-      const uid = await ensureSupabaseSession();
-      setUser({ id: uid, email: FIXED_USER_ID, name: FIXED_USER_ID });
-      setSenderName(FIXED_USER_ID);
-      fetchEntries(uid);
-    } catch (err) {
-      console.error('Post-login setup failed:', err);
-      clearLocalSession();
-      setImportStatus({
-        type: 'error',
-        message: 'Logged in, but cloud sync failed. Check Supabase account setup.',
-      });
-    }
+    // Establish a real Supabase session so RLS policies will accept writes.
+    // Throws with a readable message if it fails — Auth shows the error and
+    // resets the button, so the user is never stuck on "Please wait...".
+    const uid = await ensureSupabaseSession();
+    setUser({ id: uid, email: FIXED_USER_ID, name: FIXED_USER_ID });
+    setSenderName(FIXED_USER_ID);
+    fetchEntries(uid);
   };
 
   const fetchEntries = async (_uid?: string) => {

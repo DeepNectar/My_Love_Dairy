@@ -1,7 +1,14 @@
 import { useState, useEffect, useRef } from 'react';
 import { supabase, DiaryEntry as SupabaseEntry } from './lib/supabase';
 import Auth from './components/Auth';
-import { HEADING_CATEGORIES, defaultHeading, buildHeadingText, parseTemplateEntries } from './lib/headings';
+import {
+  HEADING_CATEGORIES,
+  defaultHeading,
+  buildHeadingText,
+  parseTemplateEntries,
+  compareChronologically,
+  dateRangeOf,
+} from './lib/headings';
 import { FIXED_USER_ID, ensureSupabaseSession } from './lib/hardcodedAuth';
 import { readLocalSession, clearLocalSession } from './lib/localSession';
 
@@ -44,7 +51,7 @@ function App() {
           const uid = await ensureSupabaseSession();
           if (!mounted) return;
           setUser({ id: uid, email: FIXED_USER_ID, name: FIXED_USER_ID });
-          setSenderName(FIXED_USER_ID);
+          setSenderName('Deep');
           fetchEntries(uid);
         }
       } catch (err) {
@@ -67,7 +74,7 @@ function App() {
     // resets the button, so the user is never stuck on "Please wait...".
     const uid = await ensureSupabaseSession();
     setUser({ id: uid, email: FIXED_USER_ID, name: FIXED_USER_ID });
-    setSenderName(FIXED_USER_ID);
+    setSenderName('Deep');
     fetchEntries(uid);
   };
 
@@ -150,7 +157,7 @@ function App() {
       user_id: user.id,
       heading: heading || defaultHeading(),
       date_time: getCurrentDateTime(),
-      sender_name: senderName || FIXED_USER_ID,
+      sender_name: (senderName === FIXED_USER_ID ? 'Deep' : senderName) || 'Deep',
       message: message.trim(),
       reflection: reflection.trim(),
     };
@@ -221,27 +228,87 @@ function App() {
     setReflection('');
   };
 
-  // --- Group entries by heading (in the canonical category order) ---
-  const groupEntriesByHeading = (list: DiaryEntry[]) => {
-    const groups: { heading: string; items: DiaryEntry[] }[] = [];
-    const orderedHeadings = HEADING_CATEGORIES.map((c) => buildHeadingText(c.emoji, c.title));
-    const map = new Map<string, DiaryEntry[]>();
-    for (const e of list) {
-      const h = e.heading || defaultHeading();
-      if (!map.has(h)) map.set(h, []);
-      map.get(h)!.push(e);
-    }
-    // Canonical headings first, then any custom headings alphabetically
-    for (const h of orderedHeadings) {
-      if (map.has(h)) {
-        groups.push({ heading: h, items: map.get(h)! });
-        map.delete(h);
+  // --- Build the COMPLETE DIARY view: one flat chronological stream, grouped under headings ---
+  interface CompleteDiaryGroup {
+    heading: string;
+    number: number;
+    items: DiaryEntry[];
+  }
+
+  const buildCompleteDiary = (list: DiaryEntry[]): CompleteDiaryGroup[] => {
+    // 1. Sort ALL entries chronologically (oldest → newest) — mandatory per format
+    const chrono = [...list].sort(compareChronologically);
+    // 2. Assign each entry to exactly ONE heading: its stored heading when valid,
+    //    otherwise auto-classify from content/sender.
+    const canonical = new Set(HEADING_CATEGORIES.map((c) => buildHeadingText(c.emoji, c.title)));
+    const withHeading = chrono.map((e) => ({
+      ...e,
+      assignedHeading: canonical.has(e.heading || '') ? e.heading! : autoClassifyHeading(e),
+    }));
+    // 3. Group in FIRST-APPEARANCE chronological order (keeps diary reading like a story)
+    const groups: CompleteDiaryGroup[] = [];
+    const indexByHeading = new Map<string, number>();
+    for (const e of withHeading) {
+      let idx = indexByHeading.get(e.assignedHeading);
+      if (idx === undefined) {
+        idx = groups.length;
+        indexByHeading.set(e.assignedHeading, idx);
+        groups.push({ heading: e.assignedHeading, number: idx + 1, items: [] });
       }
-    }
-    for (const [h, items] of [...map.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
-      groups.push({ heading: h, items });
+      groups[idx].items.push(e);
     }
     return groups;
+  };
+
+  // --- Auto-classify an entry into the most relevant heading ---
+  const autoClassifyHeading = (e: DiaryEntry): string => {
+    const t = `${e.message} ${e.reflection}`.toLowerCase();
+    const has = (...words: string[]) => words.some((w) => t.includes(w));
+    const isHer = /chota don/i.test(e.senderName);
+
+    if (has('kesha')) return '👨‍👩‍👧‍👦 About Kesha (Her Sister)';
+    if (has('arya')) return '👨‍👩‍👧‍👦 About Arya (Her Brother)';
+    if (has('good morning', 'gm ', 'morning ☀', 'sunrise', 'good night', 'goodnight', 'gn ', 'night 🌙', 'sleep tight', 'fell asleep'))
+      return '🌅 Morning & Night Greetings';
+    if (has('no reply', 'hasn', "didn't reply", 'not replied', 'waiting for reply', 'still waiting', 'left on read', 'seen but no reply'))
+      return '💭 My Messages To Her (No Reply Yet)';
+    if (has('marry', 'future', 'plan', 'dream', 'goal', 'someday', 'life together', 'kids', 'house'))
+      return '🎯 Dreams & Future Plans';
+    if (has('intimate', 'private - intimate', 'passionate', 'spicy', 'kiss', 'hold you', 'miss your touch', 'desire', 'attraction', 'beautiful body', 'crave'))
+      return '🌙 Intimate & Passionate Talks';
+    if (has('love you', 'i love', 'love of my life', 'forever yours', 'confess', 'yours only', 'heart belongs'))
+      return '💕 Romantic Confessions';
+    if (has('flirt', 'tease', 'joke', 'lol', 'lmao', 'haha', 'funny', '😂', '🤣', 'silly', 'bakchodi'))
+      return '😄 Fun Moments & Jokes';
+    if (has('sad', 'cry', 'crying', 'upset', 'angry', 'fight', 'argument', 'worried', 'anxious', 'stress', 'tired', 'support', 'care about', 'take care', 'eat something', 'health'))
+      return '🤗 Emotional Support & Care';
+    if (has('compliment', 'pretty', 'cute', 'gorgeous', 'smart', 'best girl', 'proud of you', 'adorable', 'sweet'))
+      return '💖 Sweet Compliments & Love';
+    if (isHer && !e.reflection) return '💌 Her Messages To Me';
+    return '💬 Daily Life & Important Updates';
+  };
+
+  // --- Auto-generated FINAL SUMMARY (8-10 lines) from all entries ---
+  const buildSummaryLines = (list: DiaryEntry[]): string[] => {
+    const total = list.length;
+    const hers = list.filter((e) => /chota don/i.test(e.senderName)).length;
+    const mine = total - hers;
+    const sorted = [...list].sort(compareChronologically);
+    const firstDate = sorted[0]?.dateTime || 'the beginning';
+    const lastDate = sorted[sorted.length - 1]?.dateTime || 'today';
+    const range = dateRangeOf(list.map((e) => e.dateTime)) || 'dates not specified';
+    return [
+      `This diary holds ${total} precious moments between me (Deep) and 🫰🫶🏻Chota Don❣️❤️😘, spanning ${range}.`,
+      `From ${firstDate} to ${lastDate}, every entry shows how our bond grows stronger day by day.`,
+      `Our sweet morning and night greetings are the threads that tie each day together.`,
+      `${mine} of my messages and ${hers} of her messages make up the daily rhythm of our connection.`,
+      `The compliments, flirty banter, and romantic confessions keep the spark alive between us.`,
+      `Even in the quiet moments when she hasn't replied, I choose patience because waiting for her feels worth it.`,
+      `Her care — asking if I ate, wishing me good sleep — makes me feel truly loved and protected.`,
+      `My dreams of a future with her give every single day a deeper meaning.`,
+      `She makes me feel seen, cherished, and complete; this diary is proof of our beautiful journey.`,
+      `I am grateful for every word we have shared, and for every one still to come.`,
+    ];
   };
 
   // --- Import/Export Functions ---
@@ -262,16 +329,59 @@ function App() {
   };
 
   const handleExportText = () => {
-    const groups = groupEntriesByHeading(entries);
-    const text = groups
-      .map((group, idx) => {
+    // Export in the COMPLETE DIARY format: chronological, grouped under numbered headings,
+    // with date range at top and a final summary at the bottom.
+    const groups = buildCompleteDiary(entries);
+    const range = dateRangeOf(entries.map((e) => e.dateTime)) || 'Dates not specified';
+    const headingSections = groups
+      .map((group) => {
         const lines = group.items.map(
           (entry) =>
             `- Message: ${entry.dateTime} - ${entry.senderName}: "${entry.message}"\n  What I felt: ${entry.reflection}`
         );
-        return `#### HEADING ${idx + 1}: ${group.heading}\n\n${lines.join('\n\n')}\n\n---\n`;
+        return `#### HEADING ${group.number}: ${group.heading}\n\n${lines.join('\n\n')}\n\n---\n`;
       })
       .join('\n');
+
+    // Final summary — auto-generated from the reorganized entries (8-10 lines)
+    const total = entries.length;
+    const hers = entries.filter((e) => /chota don/i.test(e.senderName)).length;
+    const mine = total - hers;
+    const sortedDates = [...entries].sort(compareChronologically);
+    const firstDate = sortedDates[0]?.dateTime || 'the beginning';
+    const lastDate = sortedDates[sortedDates.length - 1]?.dateTime || 'today';
+    const summaryLines = [
+      `This diary holds ${total} precious moments between me (Deep) and 🫰🫶🏻Chota Don❣️❤️😘, spanning ${range}.`,
+      `From ${firstDate} to ${lastDate}, every entry shows how our bond grows stronger day by day.`,
+      `Our sweet morning and night greetings are the threads that tie each day together.`,
+      `${mine} of my messages and ${hers} of her messages make up the daily rhythm of our connection.`,
+      `The compliments, flirty banter, and romantic confessions keep the spark alive between us.`,
+      `Even in the quiet moments when she hasn't replied, I choose patience because waiting for her feels worth it.`,
+      `Her care — asking if I ate, wishing me good sleep — makes me feel truly loved and protected.`,
+      `My dreams of a future with her give every single day a deeper meaning.`,
+      `She makes me feel seen, cherished, and complete; this diary is proof of our beautiful journey.`,
+      `I am grateful for every word we have shared, and for every one still to come.`,
+    ];
+    const summary = [
+      `### 📌 FINAL SUMMARY - COMPLETE DIARY`,
+      ``,
+      ...summaryLines,
+      ``,
+      `========================================`,
+    ].join('\n');
+
+    const text = [
+      `========================================`,
+      `📖 COMPLETE DIARY - DEEP & 🫰🫶🏻CHOTA DON❣️❤️😘`,
+      `========================================`,
+      ``,
+      `### Date: ${range}`,
+      ``,
+      `---`,
+      ``,
+      headingSections,
+      summary,
+    ].join('\n');
     const blob = new Blob([text], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -368,6 +478,9 @@ function App() {
           throw new Error('No valid entries found in the file.');
         }
 
+        // Sort chronologically (oldest -> newest) so cloud order matches the diary format
+        imported.sort(compareChronologically);
+
         // Insert all entries to Supabase
         const entriesToInsert = imported.map(entry => ({
           user_id: user.id,
@@ -413,7 +526,8 @@ function App() {
     (entry.heading || '').toLowerCase().includes(searchQuery.toLowerCase())
   );
 
-  const groupedFilteredEntries = groupEntriesByHeading(filteredEntries);
+  const completeDiaryGroups = buildCompleteDiary(filteredEntries);
+  const diaryDateRange = dateRangeOf(entries.map((e) => e.dateTime));
 
   // Show loading state
   if (loading) {
@@ -668,18 +782,19 @@ function App() {
                 </select>
               </div>
 
-              {/* Sender Name */}
+              {/* Sender Name — Deep or Chota Don, per diary format */}
               <div>
                 <label className="block text-sm font-medium text-amber-800 mb-1.5">
-                  Your Name
+                  Who is this message from?
                 </label>
-                <input
-                  type="text"
+                <select
                   value={senderName}
                   onChange={(e) => setSenderName(e.target.value)}
-                  placeholder="Enter your name..."
                   className="w-full px-4 py-2.5 border border-amber-200 rounded-xl focus:ring-2 focus:ring-amber-400 focus:border-transparent outline-none transition bg-amber-50/50"
-                />
+                >
+                  <option value="Deep">Deep (me)</option>
+                  <option value="🫰🫶🏻Chota Don❣️❤️😘">🫰🫶🏻Chota Don❣️❤️😘 (her)</option>
+                </select>
               </div>
 
               {/* Message Content */}
@@ -756,12 +871,31 @@ function App() {
           </p>
         )}
 
-        {/* Diary Entries — grouped by heading */}
+        {/* 📖 COMPLETE DIARY banner — chronological, grouped under headings */}
+        {entries.length > 0 && (
+          <div className="mb-6 bg-white/70 backdrop-blur-sm rounded-2xl border-2 border-amber-200 p-5 text-center shadow-sm">
+            <p className="text-xs tracking-widest text-amber-500 font-semibold mb-1">========================================</p>
+            <h2 className="text-xl sm:text-2xl font-bold text-amber-900 font-serif">
+              📖 COMPLETE DIARY — DEEP &amp; 🫰🫶🏻CHOTA DON❣️❤️😘
+            </h2>
+            <p className="text-xs tracking-widest text-amber-500 font-semibold mt-1 mb-2">========================================</p>
+            <p className="text-sm text-amber-700">
+              <span className="font-semibold">Date:</span>{' '}
+              {diaryDateRange || 'Date not specified — arranged by context'}
+            </p>
+            <p className="text-xs text-amber-600 mt-1">Oldest → newest · grouped under headings · nothing added, nothing removed</p>
+          </div>
+        )}
+
+        {/* Diary Entries — chronological stream grouped under numbered headings */}
         <div className="space-y-8">
-          {groupedFilteredEntries.map((group) => (
+          {completeDiaryGroups.map((group) => (
             <section key={group.heading}>
               {/* Heading title */}
               <h2 className="text-lg font-bold text-amber-900 font-serif mb-3 flex items-center gap-2 border-b-2 border-amber-200 pb-2">
+                <span className="text-xs font-bold text-white bg-amber-500 rounded-full w-6 h-6 flex items-center justify-center shrink-0">
+                  {group.number}
+                </span>
                 {group.heading}
                 <span className="text-xs font-normal text-amber-600 bg-amber-100 rounded-full px-2 py-0.5">
                   {group.items.length}
@@ -857,6 +991,24 @@ function App() {
             <div className="text-4xl mb-3">🔍</div>
             <p className="text-amber-700">No entries found matching "{searchQuery}"</p>
           </div>
+        )}
+
+        {/* 📌 FINAL SUMMARY — shown after all reorganized entries */}
+        {filteredEntries.length > 0 && !searchQuery && (
+          <section className="mt-10 bg-gradient-to-r from-amber-50 to-orange-50 rounded-2xl border-2 border-amber-200 p-6 shadow-sm">
+            <h2 className="text-lg font-bold text-amber-900 font-serif mb-3 text-center">
+              📌 FINAL SUMMARY — COMPLETE DIARY
+            </h2>
+            <ul className="space-y-2 text-sm text-amber-800 leading-relaxed max-w-2xl mx-auto">
+              {buildSummaryLines(entries).map((line, i) => (
+                <li key={i} className="flex gap-2">
+                  <span className="text-amber-400">•</span>
+                  <span>{line}</span>
+                </li>
+              ))}
+            </ul>
+            <p className="text-center text-xs tracking-widest text-amber-500 font-semibold mt-4">========================================</p>
+          </section>
         )}
       </main>
 

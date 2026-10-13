@@ -11,12 +11,22 @@ export const supabase = createClient(supabaseUrl, supabaseAnonKey);
 export interface DiaryEntry {
   id: string;
   user_id: string;
+  heading: string;
   date_time: string;
   sender_name: string;
   message: string;
   reflection: string;
   created_at: string;
   updated_at: string;
+}
+
+export interface HeadingCategoryRow {
+  id: number;
+  emoji: string;
+  title: string;
+  when_to_use: string;
+  only_if_mentioned: boolean;
+  sort_order: number;
 }
 
 export interface User {

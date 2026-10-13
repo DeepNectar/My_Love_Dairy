@@ -1,9 +1,11 @@
 import { useState, useEffect, useRef } from 'react';
 import { supabase, DiaryEntry as SupabaseEntry } from './lib/supabase';
 import Auth from './components/Auth';
+import { HEADING_CATEGORIES, defaultHeading, buildHeadingText, parseTemplateEntries } from './lib/headings';
 
 interface DiaryEntry {
   id: string;
+  heading: string;
   dateTime: string;
   senderName: string;
   message: string;
@@ -13,6 +15,7 @@ interface DiaryEntry {
 function App() {
   const [user, setUser] = useState<any>(null);
   const [entries, setEntries] = useState<DiaryEntry[]>([]);
+  const [heading, setHeading] = useState<string>(defaultHeading());
   const [senderName, setSenderName] = useState('');
   const [message, setMessage] = useState('');
   const [reflection, setReflection] = useState('');
@@ -80,6 +83,7 @@ function App() {
 
   const mapSupabaseEntry = (entry: SupabaseEntry): DiaryEntry => ({
     id: entry.id,
+    heading: entry.heading || defaultHeading(),
     dateTime: entry.date_time,
     senderName: entry.sender_name,
     message: entry.message,
@@ -128,6 +132,7 @@ function App() {
 
     const entryData = {
       user_id: user.id,
+      heading: heading || defaultHeading(),
       date_time: getCurrentDateTime(),
       sender_name: senderName || user.email || 'Anonymous',
       message: message.trim(),
@@ -168,6 +173,7 @@ function App() {
   };
 
   const handleEdit = (entry: DiaryEntry) => {
+    setHeading(entry.heading || defaultHeading());
     setSenderName(entry.senderName);
     setMessage(entry.message);
     setReflection(entry.reflection);
@@ -194,8 +200,32 @@ function App() {
   const handleCancel = () => {
     setShowForm(false);
     setEditingId(null);
+    setHeading(defaultHeading());
     setMessage('');
     setReflection('');
+  };
+
+  // --- Group entries by heading (in the canonical category order) ---
+  const groupEntriesByHeading = (list: DiaryEntry[]) => {
+    const groups: { heading: string; items: DiaryEntry[] }[] = [];
+    const orderedHeadings = HEADING_CATEGORIES.map((c) => buildHeadingText(c.emoji, c.title));
+    const map = new Map<string, DiaryEntry[]>();
+    for (const e of list) {
+      const h = e.heading || defaultHeading();
+      if (!map.has(h)) map.set(h, []);
+      map.get(h)!.push(e);
+    }
+    // Canonical headings first, then any custom headings alphabetically
+    for (const h of orderedHeadings) {
+      if (map.has(h)) {
+        groups.push({ heading: h, items: map.get(h)! });
+        map.delete(h);
+      }
+    }
+    for (const [h, items] of [...map.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+      groups.push({ heading: h, items });
+    }
+    return groups;
   };
 
   // --- Import/Export Functions ---
@@ -216,9 +246,16 @@ function App() {
   };
 
   const handleExportText = () => {
-    const text = entries.map(entry =>
-      `Message: ${entry.dateTime} - ${entry.senderName}: "${entry.message}"\nWhat I felt: ${entry.reflection}\n\n---\n`
-    ).join('\n');
+    const groups = groupEntriesByHeading(entries);
+    const text = groups
+      .map((group, idx) => {
+        const lines = group.items.map(
+          (entry) =>
+            `- Message: ${entry.dateTime} - ${entry.senderName}: "${entry.message}"\n  What I felt: ${entry.reflection}`
+        );
+        return `#### HEADING ${idx + 1}: ${group.heading}\n\n${lines.join('\n\n')}\n\n---\n`;
+      })
+      .join('\n');
     const blob = new Blob([text], { type: 'text/plain' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -233,6 +270,19 @@ function App() {
   };
 
   const parseTextEntries = (text: string): Omit<DiaryEntry, 'id'>[] => {
+    // New template format with "#### HEADING N:" sections and "- Message:" bullets
+    const templated = parseTemplateEntries(text);
+    if (templated.length > 0) {
+      return templated.map((t) => ({
+        heading: t.heading,
+        dateTime: t.dateTime,
+        senderName: t.senderName,
+        message: t.message,
+        reflection: t.reflection,
+      }));
+    }
+
+    // Legacy plain format fallback
     const parsed: Omit<DiaryEntry, 'id'>[] = [];
     const blocks = text.split(/\n---\n|\n\n(?=Message:)/);
 
@@ -254,6 +304,7 @@ function App() {
 
         if (messageContent) {
           parsed.push({
+            heading: defaultHeading(),
             dateTime,
             senderName,
             message: messageContent,
@@ -279,6 +330,7 @@ function App() {
           const data = JSON.parse(content);
           if (Array.isArray(data)) {
             imported = data.map((item: any) => ({
+              heading: item.heading || item.date_heading || defaultHeading(),
               dateTime: item.dateTime || item.date_time || 'Unknown date',
               senderName: item.senderName || item.sender_name || 'Anonymous',
               message: item.message || '',
@@ -303,6 +355,7 @@ function App() {
         // Insert all entries to Supabase
         const entriesToInsert = imported.map(entry => ({
           user_id: user.id,
+          heading: entry.heading || defaultHeading(),
           date_time: entry.dateTime,
           sender_name: entry.senderName,
           message: entry.message,
@@ -340,8 +393,11 @@ function App() {
   const filteredEntries = entries.filter(entry =>
     entry.message.toLowerCase().includes(searchQuery.toLowerCase()) ||
     entry.reflection.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    entry.senderName.toLowerCase().includes(searchQuery.toLowerCase())
+    entry.senderName.toLowerCase().includes(searchQuery.toLowerCase()) ||
+    (entry.heading || '').toLowerCase().includes(searchQuery.toLowerCase())
   );
+
+  const groupedFilteredEntries = groupEntriesByHeading(filteredEntries);
 
   // Show loading state
   if (loading) {
@@ -484,7 +540,7 @@ function App() {
                   <span className="text-xl">📋</span>
                   <div className="flex-1">
                     <p className="font-medium text-amber-900">JSON Format</p>
-                    <p className="text-sm text-amber-700">Full backup files with all entry data including IDs and timestamps.</p>
+                    <p className="text-sm text-amber-700">Full backup files with all entry data including heading, IDs and timestamps.</p>
                     <a
                       href="/templates/diary-template.json"
                       download="diary-template.json"
@@ -497,19 +553,41 @@ function App() {
                 <div className="flex items-start gap-3 p-3 bg-orange-50 rounded-xl border border-orange-100">
                   <span className="text-xl">📝</span>
                   <div className="flex-1">
-                    <p className="font-medium text-orange-900">Text Format (.txt / .md)</p>
-                    <p className="text-sm text-orange-700">Entries in the diary format:</p>
-                    <code className="text-xs bg-orange-100 px-2 py-1 rounded mt-1 block text-orange-800">
-                      Message: [Date] - [Name]: "content"<br/>
-                      What I felt: [reflection]
+                    <p className="font-medium text-orange-900">Text / Markdown Format (.txt / .md)</p>
+                    <p className="text-sm text-orange-700 mb-1">Group entries under headings, one bullet per message:</p>
+                    <code className="text-xs bg-orange-100 px-2 py-1 rounded block text-orange-800 whitespace-pre">
+{`#### HEADING 1: [Topic Name]
+
+- Message: [Date & Time] - [Sender]: "[Message]"
+  What I felt: [Reflection]`}
                     </code>
-                    <a
-                      href="/templates/diary-template.txt"
-                      download="diary-template.txt"
-                      className="inline-flex items-center gap-1.5 mt-2 text-xs font-medium text-orange-600 hover:text-orange-800 bg-orange-100 hover:bg-orange-200 px-3 py-1.5 rounded-lg transition-colors"
-                    >
-                      ⬇️ Download Text Template
-                    </a>
+                    <div className="mt-2 text-xs text-orange-800 bg-white/60 rounded-lg border border-orange-100 p-2 max-h-40 overflow-y-auto">
+                      <p className="font-semibold mb-1">Allowed headings:</p>
+                      <ul className="space-y-0.5">
+                        {HEADING_CATEGORIES.map((c) => (
+                          <li key={c.title}>
+                            {buildHeadingText(c.emoji, c.title)}
+                            <span className="text-orange-500"> — {c.whenToUse}</span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                    <div className="flex flex-wrap gap-2 mt-2">
+                      <a
+                        href="/templates/diary-template.txt"
+                        download="diary-template.txt"
+                        className="inline-flex items-center gap-1.5 text-xs font-medium text-orange-600 hover:text-orange-800 bg-orange-100 hover:bg-orange-200 px-3 py-1.5 rounded-lg transition-colors"
+                      >
+                        ⬇️ Download Text Template
+                      </a>
+                      <a
+                        href="/templates/diary-template.md"
+                        download="diary-template.md"
+                        className="inline-flex items-center gap-1.5 text-xs font-medium text-orange-600 hover:text-orange-800 bg-orange-100 hover:bg-orange-200 px-3 py-1.5 rounded-lg transition-colors"
+                      >
+                        ⬇️ Download Markdown Template
+                      </a>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -556,6 +634,24 @@ function App() {
               </p>
             </div>
             <form onSubmit={handleSubmit} className="p-6 space-y-5">
+              {/* Heading Category */}
+              <div>
+                <label className="block text-sm font-medium text-amber-800 mb-1.5">
+                  Heading (Topic)
+                </label>
+                <select
+                  value={heading}
+                  onChange={(e) => setHeading(e.target.value)}
+                  className="w-full px-4 py-2.5 border border-amber-200 rounded-xl focus:ring-2 focus:ring-amber-400 focus:border-transparent outline-none transition bg-amber-50/50"
+                >
+                  {HEADING_CATEGORIES.map((c) => (
+                    <option key={c.title} value={buildHeadingText(c.emoji, c.title)}>
+                      {buildHeadingText(c.emoji, c.title)} — {c.whenToUse}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
               {/* Sender Name */}
               <div>
                 <label className="block text-sm font-medium text-amber-800 mb-1.5">
@@ -644,61 +740,75 @@ function App() {
           </p>
         )}
 
-        {/* Diary Entries */}
-        <div className="space-y-5">
-          {filteredEntries.map((entry) => (
-            <div
-              key={entry.id}
-              className="bg-white rounded-2xl shadow-md border border-amber-100 overflow-hidden hover:shadow-lg transition-shadow group"
-            >
-              {/* Entry Header */}
-              <div className="px-6 pt-5 pb-3 border-b border-amber-50">
-                <div className="flex items-center justify-between">
-                  <div className="flex items-center gap-2 text-sm text-amber-600">
-                    <span>🕐</span>
-                    <span className="font-medium">{entry.dateTime}</span>
-                  </div>
-                  <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
-                    <button
-                      onClick={() => handleEdit(entry)}
-                      className="p-1.5 text-amber-500 hover:text-amber-700 hover:bg-amber-100 rounded-lg transition"
-                      title="Edit"
-                    >
-                      ✏️
-                    </button>
-                    <button
-                      onClick={() => handleDelete(entry.id)}
-                      className="p-1.5 text-red-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition"
-                      title="Delete"
-                    >
-                      🗑️
-                    </button>
-                  </div>
-                </div>
-              </div>
+        {/* Diary Entries — grouped by heading */}
+        <div className="space-y-8">
+          {groupedFilteredEntries.map((group) => (
+            <section key={group.heading}>
+              {/* Heading title */}
+              <h2 className="text-lg font-bold text-amber-900 font-serif mb-3 flex items-center gap-2 border-b-2 border-amber-200 pb-2">
+                {group.heading}
+                <span className="text-xs font-normal text-amber-600 bg-amber-100 rounded-full px-2 py-0.5">
+                  {group.items.length}
+                </span>
+              </h2>
 
-              {/* Entry Content */}
-              <div className="px-6 py-4">
-                {/* Message */}
-                <div className="mb-4">
-                  <p className="text-gray-800 leading-relaxed">
-                    <span className="text-amber-700 font-semibold">Message:</span>{' '}
-                    <span className="text-amber-900 font-medium">{entry.dateTime}</span>
-                    {' - '}
-                    <span className="text-amber-700 font-medium">{entry.senderName}</span>
-                    : "<span className="italic">{entry.message}</span>"
-                  </p>
-                </div>
+              <div className="space-y-5">
+                {group.items.map((entry) => (
+                  <div
+                    key={entry.id}
+                    className="bg-white rounded-2xl shadow-md border border-amber-100 overflow-hidden hover:shadow-lg transition-shadow group"
+                  >
+                    {/* Entry Header */}
+                    <div className="px-6 pt-5 pb-3 border-b border-amber-50">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-2 text-sm text-amber-600">
+                          <span>🕐</span>
+                          <span className="font-medium">{entry.dateTime}</span>
+                        </div>
+                        <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+                          <button
+                            onClick={() => handleEdit(entry)}
+                            className="p-1.5 text-amber-500 hover:text-amber-700 hover:bg-amber-100 rounded-lg transition"
+                            title="Edit"
+                          >
+                            ✏️
+                          </button>
+                          <button
+                            onClick={() => handleDelete(entry.id)}
+                            className="p-1.5 text-red-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition"
+                            title="Delete"
+                          >
+                            🗑️
+                          </button>
+                        </div>
+                      </div>
+                    </div>
 
-                {/* Reflection */}
-                <div className="bg-gradient-to-r from-amber-50 to-orange-50 rounded-xl p-4 border border-amber-100">
-                  <p className="text-gray-700 leading-relaxed">
-                    <span className="text-orange-600 font-semibold">💭 What I felt:</span>{' '}
-                    <span className="italic">{entry.reflection}</span>
-                  </p>
-                </div>
+                    {/* Entry Content */}
+                    <div className="px-6 py-4">
+                      {/* Message */}
+                      <div className="mb-4">
+                        <p className="text-gray-800 leading-relaxed">
+                          <span className="text-amber-700 font-semibold">Message:</span>{' '}
+                          <span className="text-amber-900 font-medium">{entry.dateTime}</span>
+                          {' - '}
+                          <span className="text-amber-700 font-medium">{entry.senderName}</span>
+                          : "<span className="italic">{entry.message}</span>"
+                        </p>
+                      </div>
+
+                      {/* Reflection */}
+                      <div className="bg-gradient-to-r from-amber-50 to-orange-50 rounded-xl p-4 border border-amber-100">
+                        <p className="text-gray-700 leading-relaxed">
+                          <span className="text-orange-600 font-semibold">💭 What I felt:</span>{' '}
+                          <span className="italic">{entry.reflection}</span>
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                ))}
               </div>
-            </div>
+            </section>
           ))}
         </div>
 

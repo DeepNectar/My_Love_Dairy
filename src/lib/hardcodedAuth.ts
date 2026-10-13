@@ -178,7 +178,9 @@ export async function ensureSupabaseSession(): Promise<string> {
       // Verify the stored session still works server-side (catches stale JWTs
       // left over from deleted/recreated users or repaired auth schemas).
       const testResult = await withTimeout<{ error: unknown }>(
-        supabase.from('diary_entries').select('id', { count: 'exact', head: true }).limit(1),
+        Promise.resolve(
+          supabase.from('diary_entries').select('id', { count: 'exact', head: true }).limit(1)
+        ),
         REQUEST_TIMEOUT_MS,
         'Session verify'
       );

@@ -63,7 +63,7 @@ function App() {
 
   const handleAuthSuccess = async () => {
     // Establish a real Supabase session so RLS policies will accept writes.
-    // Throws with a readable message if it fails — Auth shows the error and
+    // Throws with a readable message on failure — Auth shows the error and
     // resets the button, so the user is never stuck on "Please wait...".
     const uid = await ensureSupabaseSession();
     setUser({ id: uid, email: FIXED_USER_ID, name: FIXED_USER_ID });

@@ -127,14 +127,20 @@ export async function ensureSupabaseSession(): Promise<string> {
       // Wrong credentials / unknown user → retrying is pointless.
       if (/invalid login credentials|email or password|not confirmed|user not found/i.test(msg)) {
         throw new Error(
-          'Supabase login rejected: ' + msg +
-          '. Create the account in Supabase → Authentication → Users with email ' +
-          SUPABASE_ACCOUNT_EMAIL + ' and enable "Confirm email" OFF (see schema.sql section 6).'
+          'Cloud account "' + SUPABASE_ACCOUNT_EMAIL + '" not found in Supabase. ' +
+          'Fix: Dashboard → Authentication → Users → "Add user" (email above, password DeepuH@2805, ' +
+          'auto-confirm ON), or run: npm run create-auth-user (see supabase/schema.sql section 6).'
         );
       }
-      lastError = new Error(msg);
+      // Rate limit / temporary server errors → worth one retry.
+      if (/rate limit|too many requests|temporarily|over_|fetch failed|Failed to fetch/i.test(msg)) {
+        lastError = new Error(msg === 'no session returned' ? 'Supabase is rate-limiting requests' : msg);
+      } else {
+        lastError = new Error(msg);
+      }
     } catch (err: any) {
-      if (err?.message?.startsWith('Supabase login rejected')) throw err;
+      // Custom actionable messages (thrown above) must not be swallowed.
+      if (err?.message && /not found in Supabase|Supabase login rejected/.test(err.message)) throw err;
       lastError = err; // timeout / network hiccup → retry once
     }
     if (attempt === 1) await new Promise((r) => setTimeout(r, 500));

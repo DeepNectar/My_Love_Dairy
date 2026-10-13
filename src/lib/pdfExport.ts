@@ -1,16 +1,19 @@
 // A4 PDF export for the diary.
 //
-// Pipeline (avoids html2canvas, which silently produced blank/tainted pages on
-// cross-origin Google Drive images — the reason "PDF was not working"):
-//   1. Stickers are pre-loaded as CORS-clean data URLs (see lib/images.ts).
-//   2. Every printable block is measured in real CSS pixels at print scale
-//      (96 px/inch) and re-flowed into fixed A4 sheets with narrow margins, so
-//      no sheet overflows and no content is dropped.
-//   3. Each sheet is rasterized from its DOM node via SVG foreignObject
-//      (styles inlined) onto a canvas at 300 DPI-equivalent resolution.
-//   4. The header band (photo + title) sits on top of page 1, the footer band
-//      (both signatures) is pinned to the bottom of every sheet, and
-//      "Page N of M" is stamped in the bottom-right corner.
+// Why the old export produced blank pages / missing header & footer:
+//   html2canvas silently fails on cross-origin Google Drive images and on
+//   complex modern CSS — it painted white bands where the header/footer should be.
+// New pipeline (no html2canvas):
+//   1. Every <img> (header photo, both signatures, stickers) is fetched and
+//      swapped for a CORS-clean data: URL BEFORE anything is measured/drawn.
+//   2. Each DOM section is snapshotted into an SVG <foreignObject> with fully
+//      inlined computed styles + XHTML-escaped markup, then decoded by the
+//      browser's own SVG renderer onto a canvas at ~300 DPI.
+//   3. Sections are packed into exact A4 sheets (210×297mm, narrow 8mm margins)
+//      honouring the same pagination the user flipped through on-screen.
+//   4. The header band sits on top of EVERY sheet, the signature footer is
+//      pinned to the bottom of EVERY sheet, and "Page N of M" is stamped in
+//      the bottom-right corner.
 import { jsPDF } from 'jspdf';
 import { loadDataUrlCached } from './images';
 
@@ -143,6 +146,36 @@ export function flowIntoPages(blocks: MeasuredBlock[], availableHeightCss: numbe
   return pages;
 }
 
+// ---------------------------------------------------------------------------
+// SVG snapshot rasterizer
+// ---------------------------------------------------------------------------
+
+const XML_ATTR_ESC: Record<string, string> = { '&': '&amp;', '"': '&quot;', '<': '&lt;', '>': '&gt;' };
+const escapeAttr = (s: string) => s.replace(/[&"<>]/g, (c) => XML_ATTR_ESC[c]);
+const escapeText = (s: string) => s.replace(/[&<>]/g, (c) => XML_ATTR_ESC[c] ?? c);
+
+const VOID_TAGS = new Set(['area', 'base', 'br', 'col', 'embed', 'hr', 'img', 'input', 'link', 'meta', 'param', 'source', 'track', 'wbr']);
+
+/** Serialize an element tree as well-formed XHTML (void elements self-closed). */
+function toXhtml(el: Element): string {
+  const ser = (n: Node): string => {
+    if (n.nodeType === 3) return escapeText(n.textContent || '');
+    if (n.nodeType !== 1) return '';
+    const e = n as Element;
+    const tag = e.tagName.toLowerCase();
+    let open = `<${tag}`;
+    for (const attr of Array.from(e.attributes)) {
+      open += ` ${attr.name}="${escapeAttr(attr.value)}"`;
+    }
+    if (VOID_TAGS.has(tag)) return `${open}/>`;
+    open += '>';
+    let inner = '';
+    for (const c of Array.from(e.childNodes)) inner += ser(c);
+    return `${open}${inner}</${tag}>`;
+  };
+  return ser(el);
+}
+
 /** Inline computed styles so the cloned markup renders identically inside an SVG foreignObject. */
 function inlineComputedStyles(root: HTMLElement): string {
   const nodes: HTMLElement[] = [root, ...(Array.from(root.querySelectorAll('*')) as HTMLElement[])];
@@ -159,10 +192,13 @@ function inlineComputedStyles(root: HTMLElement): string {
     }
     n.setAttribute('style', style);
   }
-  return new XMLSerializer().serializeToString(root);
+  return toXhtml(root);
 }
 
-/** Rasterize a DOM node into a canvas of exactly `widthCss` × auto height (CSS px units). */
+/**
+ * Snapshot a DOM node into an SVG rendered by the browser's native SVG engine.
+ * Throws only if the browser itself refuses to decode the SVG (logged for debug).
+ */
 async function rasterizeNode(el: HTMLElement, widthCss: number): Promise<{ canvas: HTMLCanvasElement; heightCss: number }> {
   const heightCss = el.offsetHeight || el.scrollHeight;
   const clone = el.cloneNode(true) as HTMLElement;
@@ -177,15 +213,22 @@ async function rasterizeNode(el: HTMLElement, widthCss: number): Promise<{ canva
   const inner = inlineComputedStyles(clone);
   const svg =
     `<svg xmlns="http://www.w3.org/2000/svg" width="${widthCss}" height="${heightCss}" viewBox="0 0 ${widthCss} ${heightCss}">` +
-    `<foreignObject width="${widthCss}" height="${heightCss}">${inner}</foreignObject></svg>`;
+    `<foreignObject width="${widthCss}" height="${heightCss}">` +
+    `<div xmlns="http://www.w3.org/1999/xhtml">${inner}</div>` +
+    `</foreignObject></svg>`;
 
   const url = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
   const img = new Image();
-  await new Promise<void>((resolve, reject) => {
-    img.onload = () => resolve();
-    img.onerror = () => reject(new Error('Failed to rasterize a page section.'));
-    img.src = url;
-  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error('SVG snapshot failed to decode.'));
+      img.src = url;
+    });
+  } catch (err) {
+    console.error('[pdf] rasterization failed for node:', el.id || el.className, err);
+    throw err;
+  }
 
   const canvas = document.createElement('canvas');
   canvas.width = Math.round(widthCss * PRINT_SCALE);
@@ -197,7 +240,7 @@ async function rasterizeNode(el: HTMLElement, widthCss: number): Promise<{ canva
   return { canvas, heightCss };
 }
 
-/** Rasterize a single content block (text-only, no images) straight from the live DOM node. */
+/** Rasterize a single content block straight from the live DOM node. */
 async function rasterizeBlock(b: MeasuredBlock): Promise<HTMLCanvasElement> {
   const { canvas } = await rasterizeNode(b.el, CONTENT_W_CSS);
   return canvas;
@@ -232,9 +275,23 @@ export async function exportDiaryToA4Pdf(opts: PdfOptions): Promise<number> {
   const bottomUsed = (bottomBand ? bottomBand.heightCss + bandGapCss : 0) + PAGE_NUMBER_RESERVE_CSS;
   const availableCss = SHEET_H_CSS - MARGIN_CSS * 2 - topUsed - bottomUsed;
 
-  const blocks = measureBlocks(container);
-  if (blocks.length === 0) throw new Error('No content found to export.');
-  const pages = flowIntoPages(blocks, Math.max(availableCss, 100));
+  // The site already packs the SAME atomic blocks into these pages; honour
+  // that pagination so the PDF matches what the user flipped through on-screen.
+  const pageNodes = Array.from(container.querySelectorAll<HTMLElement>('[data-page]'));
+  let pages: MeasuredBlock[][];
+  if (pageNodes.length > 0) {
+    pages = [];
+    for (const pn of pageNodes) {
+      const blocks = measureBlocks(pn);
+      // safety net: if a page somehow overflows, split it across sheets
+      for (const part of flowIntoPages(blocks, Math.max(availableCss, 100))) pages.push(part);
+    }
+    if (pages.length === 0) pages.push([]);
+  } else {
+    const blocks = measureBlocks(container);
+    if (blocks.length === 0) throw new Error('No content found to export.');
+    pages = flowIntoPages(blocks, Math.max(availableCss, 100));
+  }
 
   const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4', compress: true });
 

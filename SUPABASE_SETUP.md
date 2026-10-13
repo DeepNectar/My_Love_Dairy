@@ -262,7 +262,7 @@ and resets its password — all in one go.
 - Fix steps:
   1. Supabase Dashboard → Settings → General → confirm the project is **UNPAUSED** (paused projects also throw odd DB errors).
   2. SQL Editor → run **section 7** of `supabase/schema.sql` (restores auth schema/tables safely with IF NOT EXISTS).
-  3. Then re-run **section 6** (creates the deepnectar@diary-app.local user), or use Dashboard → Authentication → Users → Add user (email `deepnectar@diary-app.local`, password `DeepuH@2805`, Auto Confirm ON).
+  3. Then re-run **section 6** (creates the depu_h2805@student.uml.edu user), or use Dashboard → Authentication → Users → Add user (email `depu_h2805@student.uml.edu`, password `DeepuH@2805`, Auto Confirm ON).
   4. Verify: `npm run create-auth-user` should print "✅ Password login verified".
 - If it STILL fails after step 2, contact Supabase support and give them the `error_id` from the failing `/auth/v1/token` response (browser DevTools → Network tab).
 - ⚠️ Never run `DROP SCHEMA auth CASCADE`; sections 1–5 of schema.sql are safe to re-run but section 6 must be run last.
@@ -289,7 +289,7 @@ Do ONE of these:
 
 ### Option A — Dashboard (easiest)
 1. Supabase Dashboard → **Authentication → Users → Add user**
-   - Email: `deepnectar@diary-app.local`
+   - Email: `depu_h2805@student.uml.edu`
    - Password: `DeepuH@2805`
    - ✅ Check **Auto Confirm User**
 2. **Authentication → Sign In / Up → Email**: turn **OFF** "Confirm email".

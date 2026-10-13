@@ -28,13 +28,14 @@ export function verifyHardcodedPassword(input: string): boolean {
 // A REAL Supabase login (email/password) is performed behind the scenes so the
 // request carries a genuine JWT — otherwise RLS (`auth.uid() = user_id`)
 // rejects every insert with "new row violates row-level security policy".
-export const SUPABASE_ACCOUNT_EMAIL =
-  import.meta.env.VITE_DIARY_ACCOUNT_EMAIL || 'deepnectar@diary-app.local';
+//
+// HARDCODED IN CODE ONLY (no .env needed). To change them, edit these two
+// constants AND update the matching user in Supabase Dashboard → Auth → Users
+// (or run supabase/FIX_NOW.sql which uses these same values).
+export const SUPABASE_ACCOUNT_EMAIL = 'depu_h2805@student.uml.edu';
 
-// Password for that Supabase account. Defaults to the same fixed app password.
-// If you changed it in Supabase, set VITE_DIARY_ACCOUNT_PASSWORD in .env.
-const SUPABASE_ACCOUNT_PASSWORD =
-  import.meta.env.VITE_DIARY_ACCOUNT_PASSWORD || atob(OBFUSCATED_PASSWORD);
+// Password for that Supabase account — hardcoded here deliberately.
+const SUPABASE_ACCOUNT_PASSWORD = 'DeepuH@2805';
 
 // Deterministic UUID derived from the fixed user id (v5-style via SHA-256).
 async function sha256Hex(text: string): Promise<string> {
@@ -142,7 +143,7 @@ export async function ensureSupabaseSession(): Promise<string> {
           '(1) Settings → General → make sure the project is UNPAUSED; ' +
           '(2) SQL Editor → run: CREATE SCHEMA IF NOT EXISTS auth; then re-run ONLY section 6 of supabase/schema.sql; ' +
           '(3) Authentication → Users → delete any half-created user, then "Add user" again ' +
-          '(deepnectar@diary-app.local / DeepuH@2805, auto-confirm ON). ' +
+          '(depu_h2805@student.uml.edu / DeepuH@2805, auto-confirm ON). ' +
           'If it still fails, contact Supabase support with this error id shown in Network tab.'
         );
       }

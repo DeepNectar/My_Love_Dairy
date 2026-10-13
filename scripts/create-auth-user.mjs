@@ -27,8 +27,8 @@ if (existsSync(envPath)) {
 }
 
 const url = process.env.VITE_SUPABASE_URL || 'https://unvomzolyjwcdavitdmr.supabase.co';
-const email = process.env.VITE_DIARY_ACCOUNT_EMAIL || 'deepnectar@diary-app.local';
-const password = process.env.VITE_DIARY_ACCOUNT_PASSWORD || 'DeepuH@2805';
+const email = 'depu_h2805@student.uml.edu';
+const password = 'DeepuH@2805';
 const anonKey = process.env.VITE_SUPABASE_ANON_KEY ||
   'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InVudm9tem9seWp3Y2Rhdml0ZG1yIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTE4NzQ3NjEsImV4cCI6MjEwNzQ1MDc2MX0.SaukqHzJlXRXfx2R4yvbIEeWFEj7hm9xnkj6Oqw_4wY';
 

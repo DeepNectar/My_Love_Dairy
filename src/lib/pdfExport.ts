@@ -15,7 +15,7 @@
 //      pinned to the bottom of EVERY sheet, and "Page N of M" is stamped in
 //      the bottom-right corner.
 import { jsPDF } from 'jspdf';
-import { loadDataUrlCached } from './images';
+import { loadDataUrlCached, driveIdFromLink } from './images';
 
 export const A4_MM = { width: 210, height: 297 } as const;
 
@@ -37,6 +37,8 @@ const CANVAS_H = Math.round(SHEET_H_CSS * PRINT_SCALE);
 export const CONTENT_W_CSS = SHEET_W_CSS - MARGIN_CSS * 2;
 /** Vertical space reserved at the bottom of every sheet for "Page N of M" (px). */
 export const PAGE_NUMBER_RESERVE_CSS = Math.round(10 * CSS_PX_PER_MM);
+/** Horizontal space reserved at the bottom-right corner for "Page N of M" (px). */
+export const PAGE_NUMBER_RESERVE_W_CSS = Math.round(45 * CSS_PX_PER_MM);
 /** Gap between the header band and the content, and above the footer band (px). */
 export const BAND_GAP_CSS = Math.round(2 * CSS_PX_PER_MM);
 /** Tiny safety buffer so rounding never pushes a line past the sheet edge (px). */
@@ -66,9 +68,72 @@ export interface PdfBand {
   position: 'top' | 'bottom';
 }
 
+/** A sticker (image from a link) that should decorate the exported sheets. */
+export interface PdfSticker {
+  id: string;
+  url: string;       // Google Drive share link or direct image URL
+  page?: number;     // explicit 0-based sheet index (undefined → random placement)
+  xPct?: number;     // horizontal position as % of the sheet width
+  yPct?: number;     // vertical position as % of the sheet height
+  sizePct?: number;  // width as % of the sheet width
+  rotate?: number;   // degrees
+}
+
+/**
+ * Deterministic pseudo-random numbers from a string seed (FNV-1a hash +
+ * xorshift). Same sticker ID always yields the same "random" position — so the
+ * preview and the exported PDF place every scattered sticker identically, and
+ * re-exports never shuffle the layout.
+ */
+export function seededRandomFrom(seed: string): number {
+  let h = 2166136261 >>> 0;
+  for (let i = 0; i < seed.length; i++) {
+    h ^= seed.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  h ^= h << 13; h = h >>> 0;
+  h ^= h >> 17;
+  h ^= h << 5; h = h >>> 0;
+  return (h >>> 0) / 4294967296;
+}
+
+/**
+ * Resolve one sticker onto ONE or MORE A4 sheets ("as recommended" scatter mode):
+ *  - explicit `page`           → that sheet only, at the given (or random) spot
+ *  - `page: -1`                → exactly one randomly chosen sheet
+ *  - no page info at all       → the WHOLE document: one copy on every sheet,
+ *                                each at its own deterministic random position
+ * The SAME function runs in the on-screen preview and in the exporter, which
+ * is what keeps the PDF identical to the HTML site preview.
+ */
+export function resolveStickerPlacements(
+  s: PdfSticker,
+  totalPages: number,
+): Array<{ page: number; xPct: number; yPct: number; sizePct: number; rotate: number }> {
+  const T = Math.max(1, totalPages);
+  const size = s.sizePct ?? 11;               // modest footprint when scattering
+  const baseRotate = s.rotate ?? -4;
+  const mk = (page: number, q: number) => ({
+    page,
+    // keep stickers fully inside the sheet, clear of the 8mm margins & corner number
+    xPct: s.xPct ?? 6 + q * (86 - size),      // 6% … 92%-size
+    yPct: s.yPct ?? 14 + ((q * 7919) % 1000) / 1000 * (70 - size * 0.5), // 14% … ~84%
+    sizePct: size,
+    rotate: s.rotate ?? Math.round((baseRotate + ((q * 104729) % 13) - 6) * 10) / 10,
+  });
+  if (typeof s.page === 'number') {
+    if (s.page === -1) return [mk(Math.floor(seededRandomFrom(`${s.id}:page`) * T), seededRandomFrom(`${s.id}:pos`))];
+    return [mk(Math.max(0, Math.min(T - 1, s.page)), seededRandomFrom(`${s.id}:pos`))];
+  }
+  // No page pinned → decorate every sheet, one deterministic random spot each.
+  return Array.from({ length: T }, (_, p) => mk(p, seededRandomFrom(`${s.id}:${p}`)));
+}
+
 export interface PdfOptions {
   blocksSelector: string;
   bands?: PdfBand[];
+  /** Stickers scattered onto the sheets (unresolved Drive links are loaded automatically). */
+  stickers?: PdfSticker[];
   fileName: string;
   onPageProgress?: (done: number, total: number) => void;
   /**
@@ -91,6 +156,33 @@ async function nextFrame() {
   await wait(0);
 }
 
+/** Resolve any image reference (Drive share link or direct URL) to a data: URL. */
+async function toDataUrlAnyForm(ref: string): Promise<string> {
+  const attempts = [ref];
+  const id = driveIdFromLink(ref);
+  if (id && !/^https?:/i.test(ref)) attempts.push(`https://drive.google.com/thumbnail?id=${id}&sz=w1600`);
+  let lastErr: unknown = null;
+  for (const a of attempts) {
+    try {
+      return await loadDataUrlCached(a);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error('Could not load sticker image');
+}
+
+/** Load a sticker image into an <img> element (data URL, CORS-clean). */
+async function hydrateStickerImg(img: HTMLImageElement, url: string) {
+  const dataUrl = await toDataUrlAnyForm(url);
+  await new Promise<void>((resolve) => {
+    img.onload = () => resolve();
+    img.onerror = () => resolve();
+    img.removeAttribute('crossorigin');
+    img.src = dataUrl;
+  });
+}
+
 /** Replace every remote <img src> inside `root` with a CORS-clean data URL. */
 async function inlineImages(root: HTMLElement) {
   const imgs = Array.from(root.querySelectorAll('img'));
@@ -99,13 +191,7 @@ async function inlineImages(root: HTMLElement) {
       const src = img.getAttribute('src') || '';
       if (!src || src.startsWith('data:')) return;
       try {
-        const dataUrl = await loadDataUrlCached(src);
-        await new Promise<void>((resolve) => {
-          img.onload = () => resolve();
-          img.onerror = () => resolve();
-          img.removeAttribute('crossorigin');
-          img.src = dataUrl;
-        });
+        await hydrateStickerImg(img, src);
       } catch {
         /* keep going: a single unreachable image must not fail the whole PDF */
       }
@@ -379,9 +465,80 @@ function measureTrueHeight(el: HTMLElement): number {
   return h;
 }
 
+/** Draw one sticker onto a sheet canvas as a polaroid-style tilted photo. */
+function drawStickerOnSheet(
+  ctx: CanvasRenderingContext2D,
+  img: HTMLImageElement,
+  p: { xPct: number; yPct: number; sizePct: number; rotate: number },
+) {
+  const S = PRINT_SCALE;
+  const wPx = (p.sizePct / 100) * SHEET_W_CSS * S;
+  if (!img.naturalWidth || !img.naturalHeight || wPx < 4) return;
+  const hPx = wPx * (img.naturalHeight / img.naturalWidth);
+  const cx = (p.xPct / 100) * SHEET_W_CSS * S + wPx / 2;
+  const cy = (p.yPct / 100) * SHEET_H_CSS * S + hPx / 2;
+  const pad = Math.max(3, wPx * 0.05);      // white polaroid frame
+  const bottomPad = pad * 2.2;              // thicker base like a printed photo
+  const rad = (p.rotate * Math.PI) / 180;
+
+  ctx.save();
+  ctx.translate(cx, cy);
+  ctx.rotate(rad);
+  // soft drop shadow
+  ctx.shadowColor = 'rgba(60, 30, 10, 0.35)';
+  ctx.shadowBlur = pad * 2.2;
+  ctx.shadowOffsetX = pad * 0.7;
+  ctx.shadowOffsetY = pad * 1.1;
+  ctx.fillStyle = '#ffffff';
+  roundRectPath(ctx, -wPx / 2 - pad, -hPx / 2 - pad, wPx + pad * 2, hPx + pad + bottomPad, pad * 0.8);
+  ctx.fill();
+  ctx.shadowColor = 'transparent';
+  ctx.shadowBlur = 0;
+  ctx.shadowOffsetX = 0;
+  ctx.shadowOffsetY = 0;
+  // hairline border so the white frame stays visible on light paper
+  ctx.strokeStyle = 'rgba(180, 83, 9, 0.35)';
+  ctx.lineWidth = Math.max(1, pad * 0.25);
+  roundRectPath(ctx, -wPx / 2 - pad, -hPx / 2 - pad, wPx + pad * 2, hPx + pad + bottomPad, pad * 0.8);
+  ctx.stroke();
+  ctx.drawImage(img, -wPx / 2, -hPx / 2, wPx, hPx);
+  ctx.restore();
+}
+
+function roundRectPath(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, r: number) {
+  const rr = Math.min(r, w / 2, h / 2);
+  ctx.beginPath();
+  ctx.moveTo(x + rr, y);
+  ctx.arcTo(x + w, y, x + w, y + h, rr);
+  ctx.arcTo(x + w, y + h, x, y + h, rr);
+  ctx.arcTo(x, y + h, x, y, rr);
+  ctx.arcTo(x, y, x + w, y, rr);
+  ctx.closePath();
+}
+
 export async function exportDiaryToA4Pdf(opts: PdfOptions): Promise<number> {
   const container = document.querySelector<HTMLElement>(opts.blocksSelector);
   if (!container) throw new Error('Nothing to export yet — add some entries first.');
+
+  // --- Stickers (from links) prepared independently of the DOM flow ---
+  // Each sticker image is loaded once as a CORS-clean data URL and decoded so
+  // its true aspect ratio is known before it is drawn onto the sheets.
+  const preparedStickers: Array<{ img: HTMLImageElement; sticker: PdfSticker }> = [];
+  for (const s of opts.stickers ?? []) {
+    try {
+      const dataUrl = await toDataUrlAnyForm(s.url);
+      const img = new Image();
+      await new Promise<void>((resolve, reject) => {
+        img.onload = () => resolve();
+        img.onerror = () => reject(new Error('sticker decode failed'));
+        img.src = dataUrl;
+      });
+      preparedStickers.push({ img, sticker: s });
+    } catch {
+      /* an unreachable sticker link must never fail the whole export */
+      console.warn('[pdf] sticker could not be loaded:', s.url?.slice(0, 80));
+    }
+  }
 
   // Make sure all images (stickers, Drive links) are local data URLs before measuring.
   await inlineImages(container);
@@ -457,6 +614,16 @@ export async function exportDiaryToA4Pdf(opts: PdfOptions): Promise<number> {
 
   const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4', compress: true });
 
+  // --- Sticker placements across the final sheet count ---
+  // Pinned stickers stay on their page; link-only stickers are scattered
+  // randomly (deterministically) over ALL pages, exactly like the preview.
+  const stickerPlacements: Array<{ img: HTMLImageElement; p: { page: number; xPct: number; yPct: number; sizePct: number; rotate: number } }> = [];
+  for (const { img, sticker } of preparedStickers) {
+    for (const p of resolveStickerPlacements(sticker, pages.length)) {
+      stickerPlacements.push({ img, p });
+    }
+  }
+
   for (let i = 0; i < pages.length; i++) {
     const canvas = document.createElement('canvas');
     canvas.width = CANVAS_W;
@@ -493,6 +660,21 @@ export async function exportDiaryToA4Pdf(opts: PdfOptions): Promise<number> {
     if (bottomBand) {
       const by = (SHEET_H_CSS - MARGIN_CSS - bottomBand.heightCss) * S;
       ctx.drawImage(bottomBand.canvas, MARGIN_CSS * S, by, CONTENT_W_CSS * S, bottomBand.heightCss * S);
+    }
+
+    // Stickers for this sheet — drawn ON TOP of everything, exactly like the
+    // preview. The bottom-right corner stays free so a sticker can never hide
+    // the "Page N of M" stamp.
+    const pnBoxX = SHEET_W_CSS - MARGIN_CSS - PAGE_NUMBER_RESERVE_W_CSS;
+    const pnBoxY = SHEET_H_CSS - MARGIN_CSS - PAGE_NUMBER_RESERVE_CSS;
+    for (const { img, p } of stickerPlacements) {
+      if (p.page !== i) continue;
+      const wPx = (p.sizePct / 100) * SHEET_W_CSS;
+      const hPx = img.naturalWidth && img.naturalHeight ? wPx * (img.naturalHeight / img.naturalWidth) : wPx;
+      const overlapsPageNumber =
+        p.xPct < ((pnBoxX + wPx) / SHEET_W_CSS) * 100 &&
+        p.yPct < ((pnBoxY + hPx) / SHEET_H_CSS) * 100;
+      if (!overlapsPageNumber) drawStickerOnSheet(ctx, img, p);
     }
 
     // Page number — bottom-right corner of every A4 sheet

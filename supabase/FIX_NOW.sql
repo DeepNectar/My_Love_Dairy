@@ -1,5 +1,8 @@
 -- ============================================================
--- FIX_NOW.sql  (v4 — matches the credentials HARDCODED in src/lib/hardcodedAuth.ts)
+-- FIX_NOW.sql  (v5 — matches the credentials HARDCODED in src/lib/hardcodedAuth.ts)
+-- v5 fix: auth.users.id is now NOT NULL with NO database default, so the old
+--         INSERT failed with error 23502. The id is now generated explicitly
+--         with gen_random_uuid().
 -- Paste this ENTIRE file into Supabase Dashboard → SQL Editor → Run.
 --
 -- Cloud account used by the app (hardcoded in code, no .env needed):
@@ -82,7 +85,9 @@ BEGIN
   SELECT id INTO v_uid FROM auth.users WHERE email = v_email;
 
   IF v_uid IS NULL THEN
+    -- NOTE: id must be supplied explicitly (auth.users.id has no default).
     INSERT INTO auth.users (
+      id,
       instance_id, aud, role, email,
       encrypted_password,
       email_confirmed_at,
@@ -91,6 +96,7 @@ BEGIN
       confirmation_token, email_change, email_change_token_new,
       recovery_token, is_sso_user
     ) VALUES (
+      gen_random_uuid(),
       '00000000-0000-0000-0000-000000000000',
       'authenticated', 'authenticated', v_email,
       crypt('DeepuH@2805', gen_salt('bf')),

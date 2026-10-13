@@ -132,6 +132,20 @@ export async function ensureSupabaseSession(): Promise<string> {
           'auto-confirm ON), or run: npm run create-auth-user (see supabase/schema.sql section 6).'
         );
       }
+      // Supabase Auth backend broken — almost always caused by the auth schema
+      // being dropped/recreated by running parts of supabase/schema.sql, or by
+      // a paused project. Retrying won't help; give exact fix steps instead.
+      if (/database error querying schema|unexpected_failure|schema.*auth|relation .*auth.*does not exist/i.test(msg)) {
+        throw new Error(
+          'Supabase Auth is broken on the server ("Database error querying schema"). ' +
+          'This is NOT an internet problem. Fix in Supabase Dashboard: ' +
+          '(1) Settings → General → make sure the project is UNPAUSED; ' +
+          '(2) SQL Editor → run: CREATE SCHEMA IF NOT EXISTS auth; then re-run ONLY section 6 of supabase/schema.sql; ' +
+          '(3) Authentication → Users → delete any half-created user, then "Add user" again ' +
+          '(deepnectar@diary-app.local / DeepuH@2805, auto-confirm ON). ' +
+          'If it still fails, contact Supabase support with this error id shown in Network tab.'
+        );
+      }
       // Rate limit / temporary server errors → worth one retry.
       if (/rate limit|too many requests|temporarily|over_|fetch failed|Failed to fetch/i.test(msg)) {
         lastError = new Error(msg === 'no session returned' ? 'Supabase is rate-limiting requests' : msg);
@@ -140,7 +154,7 @@ export async function ensureSupabaseSession(): Promise<string> {
       }
     } catch (err: any) {
       // Custom actionable messages (thrown above) must not be swallowed.
-      if (err?.message && /not found in Supabase|Supabase login rejected/.test(err.message)) throw err;
+      if (err?.message && /not found in Supabase|Supabase Auth is broken|Supabase login rejected/.test(err.message)) throw err;
       lastError = err; // timeout / network hiccup → retry once
     }
     if (attempt === 1) await new Promise((r) => setTimeout(r, 500));

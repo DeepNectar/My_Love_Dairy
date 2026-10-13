@@ -243,6 +243,17 @@ The entry format is defined in the display section of `App.tsx`. You can customi
 - Ensure the file format matches the expected structure
 - Check the browser console for parsing errors
 
+**"Database error querying schema" (login fails, HTTP 500 from Supabase Auth)**
+- This is a SERVER-side problem in your Supabase project — not internet, not VITE_SUPABASE_URL.
+- Cause: the `auth` schema / `auth.users` table was dropped or corrupted (e.g. by running `DROP SCHEMA auth CASCADE`, or a failed partial setup SQL). GoTrue can't query its own tables, so every sign-in returns this 500 error.
+- Fix steps:
+  1. Supabase Dashboard → Settings → General → confirm the project is **UNPAUSED** (paused projects also throw odd DB errors).
+  2. SQL Editor → run **section 7** of `supabase/schema.sql` (restores auth schema/tables safely with IF NOT EXISTS).
+  3. Then re-run **section 6** (creates the deepnectar@diary-app.local user), or use Dashboard → Authentication → Users → Add user (email `deepnectar@diary-app.local`, password `DeepuH@2805`, Auto Confirm ON).
+  4. Verify: `npm run create-auth-user` should print "✅ Password login verified".
+- If it STILL fails after step 2, contact Supabase support and give them the `error_id` from the failing `/auth/v1/token` response (browser DevTools → Network tab).
+- ⚠️ Never run `DROP SCHEMA auth CASCADE`; sections 1–5 of schema.sql are safe to re-run but section 6 must be run last.
+
 ## 📄 License
 
 MIT License - feel free to use this project for personal or commercial purposes.

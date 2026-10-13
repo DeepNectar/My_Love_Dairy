@@ -128,6 +128,10 @@ CREATE TRIGGER update_diary_entries_updated_at
 --
 -- Option B: run this SQL block as-is in the SQL Editor (creates the auth user):
 -- ------------------------------------------------------------
+-- ⚠️ WARNING: NEVER run "DROP SCHEMA auth CASCADE" or re-run sections 1-5
+-- after section 6 — dropping/recreating the `auth` schema breaks Supabase's
+-- own login system and causes: "Database error querying schema" (HTTP 500)
+-- on every sign-in. If you see that error, follow section 7 below first.
 DO $$
 DECLARE v_uid uuid := gen_random_uuid();
 BEGIN
@@ -156,4 +160,71 @@ END $$;
 -- If you use a different email/password, set them in .env:
 --   VITE_DIARY_ACCOUNT_EMAIL=...
 --   VITE_DIARY_ACCOUNT_PASSWORD=...
+-- ============================================================
+
+-- ============================================================
+-- 7) REPAIR: "Database error querying schema" on login (HTTP 500)
+-- ------------------------------------------------------------
+-- Cause: the `auth` schema / auth.users table was dropped or altered
+-- (usually by running DROP SCHEMA auth CASCADE, or an old version of
+-- section 6 failed halfway). GoTrue (Supabase Auth) can no longer query
+-- its own tables, so EVERY login fails with this error.
+--
+-- Fix: run this block ONCE in the SQL Editor, then re-run section 6 above,
+-- then verify with: npm run create-auth-user
+--
+-- NOTE: if auth.users exists but is corrupted, prefer Dashboard →
+-- Authentication → Users → delete broken users first.
+
+CREATE SCHEMA IF NOT EXISTS auth;
+
+-- Restore the core auth tables Supabase expects (safe: IF NOT EXISTS).
+CREATE TABLE IF NOT EXISTS auth.users (
+  instance_id uuid,
+  id uuid PRIMARY KEY,
+  aud varchar(255),
+  role varchar(255),
+  email varchar(255) UNIQUE,
+  encrypted_password varchar(255),
+  email_confirmed_at timestamptz,
+  phone varchar(15) UNIQUE,
+  phone_confirmed_at timestamptz,
+  confirmation_token varchar(255),
+  recovery_token varchar(255),
+  email_change_token_new varchar(255),
+  email_change varchar(255),
+  email_change_token_current varchar(255),
+  email_change_confirm_status smallint DEFAULT 0,
+  banned_until timestamptz,
+  reauthentication_token varchar(255),
+  reauthentication_sent_at timestamptz,
+  is_sso_user boolean NOT NULL DEFAULT false,
+  password_recovered boolean NOT NULL DEFAULT false,
+  deleted_at timestamptz,
+  last_sign_in_at timestamptz,
+  app_metadata jsonb DEFAULT '{}'::jsonb,
+  user_metadata jsonb DEFAULT '{}'::jsonb,
+  raw_app_meta_data jsonb DEFAULT '{}'::jsonb,
+  raw_user_meta_data jsonb DEFAULT '{}'::jsonb,
+  created_at timestamptz,
+  updated_at timestamptz
+);
+
+CREATE TABLE IF NOT EXISTS auth.identities (
+  id uuid PRIMARY KEY,
+  user_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
+  identity_data jsonb NOT NULL,
+  provider text NOT NULL,
+  provider_id text,
+  security_stamp text,
+  last_sign_in_at timestamptz,
+  created_at timestamptz,
+  updated_at timestamptz,
+  email text GENERATED ALWAYS AS (lower(identity_data->>'email')) STORED,
+  UNIQUE (provider_id, provider)
+);
+
+GRANT USAGE ON SCHEMA auth TO postgres, anon, authenticated, service_role;
+GRANT ALL ON ALL TABLES IN SCHEMA auth TO postgres, service_role;
+ALTER DEFAULT PRIVILEGES IN SCHEMA auth GRANT ALL ON TABLES TO postgres, service_role;
 -- ============================================================

@@ -2,7 +2,7 @@
 // Google Drive links the user supplied. Everything is rendered at true A4
 // content width with narrow margins so the on-screen sheet and the exported
 // PDF are pixel-identical.
-import { resolveImageUrl } from './images';
+import { resolveImageUrl, RobustImg } from './images';
 
 /** Drive link → photo shown in the top-left corner of the header on every page. */
 export const HEADER_PHOTO_LINK =
@@ -22,7 +22,7 @@ export function LoveStoryHeader() {
   return (
     <div className="ls-header">
       <div className="ls-header-photo">
-        <img src={headerPhotoSrc} alt="us" crossOrigin="anonymous" draggable={false} />
+        <RobustImg src={HEADER_PHOTO_LINK} widthHint={900} alt="us" draggable={false} />
       </div>
       <div className="ls-header-text">
         <h1 className="ls-title">💕 OUR LOVE STORY 💕</h1>
@@ -47,10 +47,10 @@ export function LoveStoryFooter() {
   return (
     <div className="ls-footer">
       <div className="ls-sign">
-        <img src={signatureSrcs[0]} alt="signature" crossOrigin="anonymous" draggable={false} />
+        <RobustImg src={SIGNATURE_LINKS[0]} widthHint={700} alt="signature" draggable={false} />
       </div>
       <div className="ls-sign">
-        <img src={signatureSrcs[1]} alt="signature" crossOrigin="anonymous" draggable={false} />
+        <RobustImg src={SIGNATURE_LINKS[1]} widthHint={700} alt="signature" draggable={false} />
       </div>
     </div>
   );

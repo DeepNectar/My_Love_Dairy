@@ -1,5 +1,153 @@
 @import "tailwindcss";
 
+/* ============ A4 page (site + PDF) ============ */
+/* Exact ISO A4 aspect ratio: 210mm x 297mm. Narrow margins (10mm). */
+.a4-sheet {
+  width: min(210mm, 96vw);
+  height: min(297mm, calc(96vw * 297 / 210));
+  position: relative;
+  background: #ffffff;
+  box-shadow: 0 10px 40px rgba(120, 53, 15, 0.25);
+  border-radius: 4px;
+  overflow: hidden;
+}
+
+.a4-page {
+  width: 210mm;
+  height: 297mm;
+  padding: 10mm; /* narrow margin — same in the exported PDF */
+  box-sizing: border-box;
+  position: absolute;
+  top: 0;
+  left: 0;
+  background: #fffdf8;
+  display: flex;
+  flex-direction: column;
+  transform-origin: top left;
+  overflow: hidden;
+}
+
+.a4-print-area {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+  font-size: 10pt;
+  line-height: 1.45;
+  color: #3f2a12;
+}
+
+.a4-page-number {
+  position: absolute;
+  bottom: 4mm;
+  right: 6mm;
+  font-size: 9pt;
+  color: #92400e;
+  font-family: Georgia, 'Times New Roman', serif;
+}
+
+/* Page-flip transition between A4 pages */
+.page-flip-enter {
+  animation: page-flip-in 0.45s ease both;
+}
+@keyframes page-flip-in {
+  from { opacity: 0; transform: translateX(var(--flip-from, 40%)) rotateY(12deg); }
+  to   { opacity: 1; transform: translateX(0) rotateY(0deg); }
+}
+
+/* Sticker-style images placed anywhere on the page */
+.diary-sticker {
+  position: absolute;
+  max-width: 70mm;
+  cursor: default;
+  user-select: none;
+  filter: drop-shadow(0 3px 6px rgba(0, 0, 0, 0.3));
+  transition: transform 0.15s ease;
+}
+.diary-sticker:hover { transform: scale(1.05) rotate(0deg) !important; }
+.diary-sticker img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 3px solid #fff;
+  border-radius: 8px;
+  box-shadow: 0 0 0 1px rgba(180, 83, 9, 0.35);
+  pointer-events: none;
+}
+.sticker-remove {
+  position: absolute;
+  top: -8px;
+  right: -8px;
+  width: 20px;
+  height: 20px;
+  border-radius: 9999px;
+  background: #dc2626;
+  color: #fff;
+  font-size: 12px;
+  line-height: 20px;
+  text-align: center;
+  border: none;
+  cursor: pointer;
+  display: none;
+  z-index: 5;
+}
+.diary-sticker:hover .sticker-remove { display: block; }
+
+.sticker-nudges {
+  display: none;
+  justify-content: center;
+  gap: 3px;
+  margin-top: 3px;
+}
+.sticker-nudges button {
+  width: 18px;
+  height: 18px;
+  font-size: 9px;
+  line-height: 1;
+  border-radius: 9999px;
+  background: rgba(0, 0, 0, 0.65);
+  color: #fff;
+  border: none;
+  cursor: pointer;
+}
+.sticker-nudges button:hover { background: rgba(0, 0, 0, 0.85); }
+.diary-sticker:hover .sticker-nudges { display: flex; }
+
+/* Entry blocks inside a page */
+.pg-heading {
+  font-family: Georgia, 'Times New Roman', serif;
+  font-weight: 700;
+  font-size: 13pt;
+  color: #78350f;
+  border-bottom: 2px solid #fcd34d;
+  padding-bottom: 2px;
+  margin: 6px 0 6px;
+  break-after: avoid;
+}
+.pg-entry {
+  border: 1px solid #f3d9a4;
+  border-radius: 6px;
+  padding: 6px 8px;
+  margin-bottom: 6px;
+  background: #ffffff;
+  break-inside: avoid;
+}
+.pg-entry .pg-meta {
+  font-size: 8.5pt;
+  color: #b45309;
+  margin-bottom: 2px;
+}
+.pg-entry .pg-msg { font-size: 10pt; color: #451a03; }
+.pg-entry .pg-feel {
+  font-size: 9pt;
+  font-style: italic;
+  color: #9a3412;
+  background: linear-gradient(to right, #fff7ed, #fffbEB);
+  border-left: 3px solid #fdba74;
+  padding: 3px 6px;
+  margin-top: 4px;
+  border-radius: 3px;
+}
+
 @keyframes fade-in {
   from {
     opacity: 0;

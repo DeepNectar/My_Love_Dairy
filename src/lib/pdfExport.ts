@@ -22,7 +22,7 @@ export const A4_MM = { width: 210, height: 297 } as const;
 /** Narrow margin used both on-site and in the exported PDF (mm). */
 export const NARROW_MARGIN_MM = 8;
 
-const CSS_PX_PER_MM = 96 / 25.4;          // browser CSS pixel size
+export const CSS_PX_PER_MM = 96 / 25.4;   // browser CSS pixel size
 const PRINT_SCALE = 300 / 96;             // canvas pixels per CSS pixel (≈300 DPI output)
 
 /** Sheet size in CSS pixels (what the DOM is laid out in). */
@@ -35,7 +35,29 @@ const CANVAS_H = Math.round(SHEET_H_CSS * PRINT_SCALE);
 
 /** Usable content area inside one sheet (CSS px), leaving room for the page number. */
 export const CONTENT_W_CSS = SHEET_W_CSS - MARGIN_CSS * 2;
-export const PAGE_NUMBER_RESERVE_CSS = Math.round(12 * CSS_PX_PER_MM);
+/** Vertical space reserved at the bottom of every sheet for "Page N of M" (px). */
+export const PAGE_NUMBER_RESERVE_CSS = Math.round(10 * CSS_PX_PER_MM);
+/** Gap between the header band and the content, and above the footer band (px). */
+export const BAND_GAP_CSS = Math.round(2 * CSS_PX_PER_MM);
+/** Tiny safety buffer so rounding never pushes a line past the sheet edge (px). */
+export const FLOW_SAFETY_CSS = 6;
+
+/**
+ * Height available to flowing content inside one A4 sheet, computed from the
+ * REAL header/footer bands measured at print width. The on-screen paginator
+ * and the PDF exporter call this SAME function — that is what guarantees the
+ * exported PDF matches the preview exactly: same blocks, same page breaks.
+ */
+export function computeAvailableFlowHeightCss(headerH: number, footerH: number): number {
+  return (
+    SHEET_H_CSS -
+    MARGIN_CSS * 2 -
+    (headerH + BAND_GAP_CSS) -
+    (footerH + BAND_GAP_CSS) -
+    PAGE_NUMBER_RESERVE_CSS -
+    FLOW_SAFETY_CSS
+  );
+}
 
 export interface PdfBand {
   /** id of the DOM node that holds the band markup (rendered off-screen) */
@@ -49,6 +71,12 @@ export interface PdfOptions {
   bands?: PdfBand[];
   fileName: string;
   onPageProgress?: (done: number, total: number) => void;
+  /**
+   * Optional: returns a cleaned clone of a DOM node right before it is
+   * rasterized (e.g. strip interactive-only chrome like hover buttons), so the
+   * PDF mirrors the visual preview instead of the raw UI markup.
+   */
+  prepareNode?: (node: HTMLElement) => HTMLElement;
 }
 
 interface MeasuredBlock {
@@ -101,6 +129,11 @@ function measureBlocks(container: HTMLElement): MeasuredBlock[] {
  */
 function sliceOversized(block: MeasuredBlock, maxH: number): MeasuredBlock[] {
   const out: MeasuredBlock[] = [];
+  // Advance the crop window a little less than its full height so consecutive
+  // slices overlap slightly — any reflow drift inside the SVG rasterizer can
+  // then never hide lines of text at a slice boundary.
+  const overlap = Math.round(6 * CSS_PX_PER_MM);
+  const step = Math.max(1, maxH - overlap);
   let offset = 0;
   while (offset < block.height) {
     const sliceH = Math.min(maxH, block.height - offset);
@@ -114,7 +147,7 @@ function sliceOversized(block: MeasuredBlock, maxH: number): MeasuredBlock[] {
     wrapper.style.overflow = 'hidden';
     wrapper.appendChild(clone);
     out.push({ el: wrapper, height: sliceH });
-    offset += sliceH;
+    offset += step;
   }
   return out.length ? out : [block];
 }
@@ -229,11 +262,13 @@ function inlineComputedStyles(root: HTMLElement): string {
 async function rasterizeNode(
   el: HTMLElement,
   widthCss: number,
-  opts?: { heightOverride?: number },
+  opts?: { heightOverride?: number; prepare?: (node: HTMLElement) => HTMLElement },
 ): Promise<{ canvas: HTMLCanvasElement; heightCss: number }> {
   const isSlice = typeof opts?.heightOverride === 'number';
   const heightCss = isSlice ? (opts as { heightOverride: number }).heightOverride : el.offsetHeight || el.scrollHeight;
-  const clone = el.cloneNode(true) as HTMLElement;
+  // Give the caller a chance to clean the snapshot (strip UI-only chrome).
+  const rawClone = opts?.prepare ? opts.prepare(el) : (el.cloneNode(true) as HTMLElement);
+  const clone = rawClone;
   clone.style.width = `${widthCss}px`;
   if (isSlice) {
     // Slice wrapper: keep the fixed-height clipping window EXACTLY as the
@@ -307,11 +342,18 @@ async function waitForImages(root: HTMLElement) {
 }
 
 /** Rasterize a single content block straight from the live DOM node. */
-async function rasterizeBlock(b: MeasuredBlock): Promise<HTMLCanvasElement> {
+async function rasterizeBlock(
+  b: MeasuredBlock,
+  prepare?: (node: HTMLElement) => HTMLElement,
+): Promise<HTMLCanvasElement> {
   // Slice wrappers (fixed-height crop windows) must be rendered with their
   // exact window height — see rasterizeNode's `heightOverride` path.
   const isSlice = b.el.style.height !== '' && parseFloat(b.el.style.top || '') < 0;
-  const { canvas } = await rasterizeNode(b.el, CONTENT_W_CSS, isSlice ? { heightOverride: b.height } : undefined);
+  const { canvas } = await rasterizeNode(
+    b.el,
+    CONTENT_W_CSS,
+    isSlice ? { heightOverride: b.height, prepare } : { prepare },
+  );
   return canvas;
 }
 
@@ -365,15 +407,18 @@ export async function exportDiaryToA4Pdf(opts: PdfOptions): Promise<number> {
   for (const band of opts.bands ?? []) {
     const node = document.getElementById(band.nodeId);
     if (!node) continue;
-    const r = await rasterizeNode(node, CONTENT_W_CSS);
+    const r = await rasterizeNode(node, CONTENT_W_CSS, { prepare: opts.prepareNode });
     if (band.position === 'top') topBand = r;
     else bottomBand = r;
   }
 
-  const bandGapCss = Math.round(2 * CSS_PX_PER_MM);
-  const topUsed = topBand ? topBand.heightCss + bandGapCss : 0;
-  const bottomUsed = (bottomBand ? bottomBand.heightCss + bandGapCss : 0) + PAGE_NUMBER_RESERVE_CSS;
-  const availableCss = SHEET_H_CSS - MARGIN_CSS * 2 - topUsed - bottomUsed;
+  const bandGapCss = BAND_GAP_CSS;
+  // ONE shared formula with the on-screen paginator — identical available
+  // height means identical page breaks between preview and exported PDF.
+  const availableCss = computeAvailableFlowHeightCss(
+    topBand ? topBand.heightCss : 0,
+    bottomBand ? bottomBand.heightCss : 0,
+  );
 
   // The site already packs the SAME atomic blocks into these pages; honour
   // that pagination so the PDF matches what the user flipped through on-screen.
@@ -429,7 +474,7 @@ export async function exportDiaryToA4Pdf(opts: PdfOptions): Promise<number> {
     }
 
     for (const b of pages[i]) {
-      const bc = await rasterizeBlock(b);
+      const bc = await rasterizeBlock(b, opts.prepareNode);
       // Hard guarantee: content is NEVER drawn into the footer band's zone.
       // If a block still reaches past the printable area (stale measurement),
       // only its fitting part is painted here; the re-flow above already put

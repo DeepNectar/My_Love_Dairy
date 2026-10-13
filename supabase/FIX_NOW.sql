@@ -1,8 +1,11 @@
 -- ============================================================
--- FIX_NOW.sql  (v5 — matches the credentials HARDCODED in src/lib/hardcodedAuth.ts)
+-- FIX_NOW.sql  (v6 — matches the credentials HARDCODED in src/lib/hardcodedAuth.ts)
 -- v5 fix: auth.users.id is now NOT NULL with NO database default, so the old
 --         INSERT failed with error 23502. The id is now generated explicitly
 --         with gen_random_uuid().
+-- v6 fix: robust to partial runs — if a previous attempt inserted the user but
+--         failed before creating the identity row (or vice-versa), this script
+--         repairs the missing pieces instead of failing on unique-violations.
 -- Paste this ENTIRE file into Supabase Dashboard → SQL Editor → Run.
 --
 -- Cloud account used by the app (hardcoded in code, no .env needed):
@@ -13,9 +16,9 @@
 --   1. Creates the diary_entries table with the EXACT columns the app uses.
 --   2. Enables RLS and creates SELECT/INSERT/UPDATE/DELETE policies so the
 --      logged-in user can only touch their own rows.
---   3. Creates/resets the cloud auth user above (same path the dashboard
---      "Add user" button uses). If this step fails with 42501, add the user
---      via the dashboard instead (instructions at the bottom).
+--   3. Creates/repairs/resets the cloud auth user above (same path the
+--      dashboard "Add user" button uses). If this step fails with 42501, add
+--      the user via the dashboard instead (instructions at the bottom).
 -- ============================================================
 
 CREATE EXTENSION IF NOT EXISTS pgcrypto;
@@ -107,34 +110,30 @@ BEGIN
       '', '', '', '', false
     )
     RETURNING id INTO v_uid;
-
-    INSERT INTO auth.identities (
-      id, user_id, provider_id, provider, identity_data,
-      last_sign_in_at, created_at, updated_at
-    ) VALUES (
-      gen_random_uuid(), v_uid, v_uid, 'email',
-      format('{"sub":"%s","email":"%s","email_verified":true}', v_uid::text, v_email)::jsonb,
-      now(), now(), now()
-    );
   ELSE
-    -- Already exists: reset password + ensure email confirmed + ensure identity row.
+    -- Already exists: reset password + ensure email is confirmed.
     UPDATE auth.users
        SET encrypted_password = crypt('DeepuH@2805', gen_salt('bf')),
            email_confirmed_at = COALESCE(email_confirmed_at, now()),
            updated_at = now()
      WHERE id = v_uid;
-
-    IF NOT EXISTS (SELECT 1 FROM auth.identities WHERE user_id = v_uid) THEN
-      INSERT INTO auth.identities (
-        id, user_id, provider_id, provider, identity_data,
-        last_sign_in_at, created_at, updated_at
-      ) VALUES (
-        gen_random_uuid(), v_uid, v_uid, 'email',
-        format('{"sub":"%s","email":"%s","email_verified":true}', v_uid::text, v_email)::jsonb,
-        now(), now(), now()
-      );
-    END IF;
   END IF;
+
+  -- Ensure the identity row exists (repair for partial runs / broken schema).
+  -- ON CONFLICT avoids unique-violation if it already exists.
+  BEGIN
+    INSERT INTO auth.identities (
+      id, user_id, provider_id, provider, identity_data,
+      status, last_sign_in_at, created_at, updated_at
+    ) VALUES (
+      gen_random_uuid(), v_uid, 'email', 'email',
+      format('{"sub":"%s","email":"%s","email_verified":true}', v_uid::text, v_email)::jsonb,
+      'verified', now(), now(), now()
+    )
+    ON CONFLICT DO NOTHING;
+  EXCEPTION WHEN OTHERS THEN
+    NULL; -- ignore if identities table shape differs; dashboard Add-user will fix it
+  END;
 END $$;
 
 -- ---------- 4. Verification ----------
@@ -149,7 +148,8 @@ FROM auth.users u
 WHERE u.email = 'depu_h2805@student.uml.edu';
 
 -- ============================================================
--- IF STEP 3 FAILED WITH "permission denied for schema auth":
+-- IF STEP 3 FAILED WITH "permission denied for schema auth" (42501)
+-- OR THE VERIFICATION ROW SHOWS confirmed=false / has_identity=false:
 -- do it in the dashboard instead (takes 30 seconds):
 --   1. Authentication -> Users -> "Add user"
 --      Email:    depu_h2805@student.uml.edu

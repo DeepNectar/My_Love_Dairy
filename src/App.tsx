@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
+import type { CSSProperties } from 'react';
 import { supabase, DiaryEntry as SupabaseEntry } from './lib/supabase';
 import Auth from './components/Auth';
 import {
@@ -11,7 +12,8 @@ import {
 } from './lib/headings';
 import { FIXED_USER_ID, ensureSupabaseSession } from './lib/hardcodedAuth';
 import { readLocalSession, clearLocalSession, writeLocalSessionItem, readLocalSessionItem } from './lib/localSession';
-import { exportDiaryToA4Pdf, CONTENT_W_CSS, CSS_PX_PER_MM, computeAvailableFlowHeightCss, resolveStickerPlacements } from './lib/pdfExport';
+import { exportDiaryToA4Pdf, renderSheetNode, CONTENT_W_CSS, CSS_PX_PER_MM, computeAvailableFlowHeightCss, resolveStickerPlacements } from './lib/pdfExport';
+import type { PdfSticker } from './lib/pdfExport';
 import { resolveImageUrl, loadDataUrlCached, RobustImg } from './lib/images';
 import { LoveStoryHeader, LoveStoryFooter } from './lib/loveStory';
 
@@ -90,6 +92,8 @@ function App() {
   const [exportingPdf, setExportingPdf] = useState(false);
   const [pdfProgress, setPdfProgress] = useState<{ done: number; total: number } | null>(null);
   const [flipDir, setFlipDir] = useState<'next' | 'prev'>('next');
+  /** The single visible A4 preview sheet — rasterized page-by-page for the PDF. */
+  const pageNodeRef = useRef<HTMLDivElement>(null);
 
   // Check auth state on mount — hardcoded login gate (DeepNectar)
   useEffect(() => {
@@ -867,13 +871,14 @@ function App() {
     const raw = stickerUrl.trim();
     if (!raw) return;
     const url = resolveImageUrl(raw); // Google Drive share links → embeddable image URLs
+    const scattered = opts.page === undefined;
     const s: Sticker = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
       url,
-      page: opts.page ?? -2, // -2 = "all pages, random spots" (see resolveStickerPlacements)
+      page: opts.page ?? -1, // -1 = "one randomly chosen page" (see resolveStickerPlacements)
       xPct: opts.xPct !== undefined ? Math.max(2, Math.min(opts.xPct, 98 - stickerSize)) : undefined,
       yPct: opts.yPct !== undefined ? Math.max(2, Math.min(opts.yPct, 95)) : undefined,
-      sizePct: opts.page === undefined ? Math.min(stickerSize, 14) : stickerSize,
+      sizePct: scattered ? Math.min(stickerSize, 14) : stickerSize,
       rotate: stickerRotate,
     };
     setStickers((prev) => [...prev, s]);
@@ -882,8 +887,8 @@ function App() {
     setStickerUrl('');
     setImportStatus({
       type: 'success',
-      message: opts.page === undefined
-        ? 'Sticker added randomly to ALL pages — it will appear in the PDF too! 💕'
+      message: scattered
+        ? 'Sticker added on a random page — it will appear in the PDF too! 💕'
         : 'Sticker added! It will appear in the PDF too.',
     });
   };
@@ -893,20 +898,69 @@ function App() {
     setStickers((prev) =>
       prev.map((s) =>
         s.id === id
-          ? { ...s, xPct: Math.max(0, Math.min(100 - s.sizePct, s.xPct + dxPct)), yPct: Math.max(0, Math.min(97, s.yPct + dyPct)) }
+          ? { ...s, xPct: Math.max(0, Math.min(100 - s.sizePct, (s.xPct ?? 0) + dxPct)), yPct: Math.max(0, Math.min(97, (s.yPct ?? 0) + dyPct)) }
           : s
       )
     );
+
+  /**
+   * Wait for EVERY image that influences page layout to finish loading
+   * (header photo, both signatures, all stickers). While any of them is still
+   * swapping fallback URLs, page heights can change — exporting mid-load is
+   * exactly how header/footer bands used to come out empty or shifted.
+   */
+  const waitDiaryImagesSettled = async (timeoutMs = 30000) => {
+    const start = Date.now();
+    const pending = () =>
+      Array.from(document.querySelectorAll<HTMLImageElement>('#ls-header-measure img, #ls-footer-measure img, .a4-page img, #pdf-blocks img'))
+        .filter((im) => !(im.complete && im.naturalWidth > 0));
+    while (pending().length && Date.now() - start < timeoutMs) {
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    try { await (document as any).fonts?.ready; } catch { /* ignore */ }
+  };
 
   const handleSaveAsPdf = async () => {
     if (exportingPdf) return;
     setExportingPdf(true);
     setShowMenu(false);
+    setPlacingMode(false);
     setPdfProgress(null);
     try {
       // Warm the image cache so the exporter never stalls on the network.
       await Promise.allSettled(stickers.map((s) => loadDataUrlCached(s.url)));
+      await waitDiaryImagesSettled();
 
+      // ---- PRIMARY PATH: "what you see is what you print" -----------------
+      // Every preview page (the exact same A4 sheet the user flips through —
+      // header band on top, ALL entries in the middle, signature footer at the
+      // bottom, page number and stickers included) is rasterized whole and
+      // dropped onto its own A4 PDF page. No re-flowing, no band stamping, so
+      // nothing can shift, clip or go missing.
+      const node = pageNodeRef.current;
+      if (node && flowPages.length > 0) {
+        const pages: { canvas: HTMLCanvasElement }[] = [];
+        for (let p = 0; p < flowPages.length; p++) {
+          setCurrentPage(p);
+          // Let React paint this page…
+          await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+          await new Promise((r) => setTimeout(r, 60));
+          // …and every image it contains settle before snapshotting it.
+          await waitDiaryImagesSettled(15000);
+          pages.push({ canvas: await renderSheetNode(node, { prepare: printClone }) });
+          setPdfProgress({ done: p + 1, total: flowPages.length });
+          await new Promise((r) => setTimeout(r, 0));
+        }
+        const n = await exportDiaryToA4Pdf({
+          blocksSelector: '#pdf-blocks',
+          pages,
+          fileName: `our-love-story-${new Date().toISOString().split('T')[0]}.pdf`,
+        });
+        setImportStatus({ type: 'success', message: `Saved PDF with ${n} A4 page${n === 1 ? '' : 's'} — identical to the preview! 💕` });
+        return;
+      }
+
+      // ---- FALLBACK PATH: off-screen blocks + stamped header/footer bands --
       const n = await exportDiaryToA4Pdf({
         blocksSelector: '#pdf-blocks',
         bands: [
@@ -929,7 +983,38 @@ function App() {
     }
   };
 
-  const stickersForCurrentPage = stickers.filter((s) => s.page === currentPage);
+  const stickersForCurrentPage = (() => {
+    const T = Math.max(flowPages.length, 1);
+    return stickers.filter((s) => {
+      // Pinned to an exact page (click-to-place).
+      if (s.page >= 0) return s.page === currentPage;
+      // -2 → one copy on EVERY page at a random spot; -1 → ONE randomly
+      // chosen page. `resolveStickerPlacements` (shared with the PDF exporter
+      // and run with the same total here) decides — so preview == PDF.
+      return resolveStickerPlacements(stickerToPdf(s, T), T).some((pl) => pl.page === currentPage);
+    });
+  })();
+
+  /** Convert an app sticker into the exporter's PdfSticker shape. */
+  const stickerToPdf = (s: Sticker, _totalPages: number): PdfSticker => {
+    // -2 is legacy "every page" storage; drop the pin so the resolver scatters
+    // one deterministic copy per sheet (same as before).
+    const page = s.page === -2 ? undefined : s.page;
+    return { id: s.id, url: s.url, page, xPct: s.xPct, yPct: s.yPct, sizePct: s.sizePct, rotate: s.rotate };
+  };
+
+  /** Sticker style for the current preview page (handles -1/-2 modes). */
+  const stickerStyle = (s: Sticker): CSSProperties => {
+    const T = Math.max(flowPages.length, 1);
+    if (s.page >= 0) {
+      return { left: `${s.xPct}%`, top: `${s.yPct}%`, width: `${s.sizePct}%`, transform: `rotate(${s.rotate}deg)` };
+    }
+    // Scattered sticker: take the placement the EXPORTER will use for this
+    // sheet — identical math, identical seed → preview == PDF.
+    const placements = resolveStickerPlacements(stickerToPdf(s, T), T);
+    const pl = placements.find((p) => p.page === currentPage) ?? placements[0];
+    return { left: `${pl.xPct}%`, top: `${pl.yPct}%`, width: `${pl.sizePct}%`, transform: `rotate(${pl.rotate}deg)` };
+  };
 
   // Show loading state
   if (loading) {
@@ -1209,22 +1294,22 @@ function App() {
               </div>
               <div className="flex gap-3 pt-2">
                 <button
+                  onClick={() => addStickerAt({})}
+                  disabled={!stickerUrl.trim()}
+                  className="flex-1 bg-pink-500 hover:bg-pink-600 disabled:opacity-40 text-white py-3 rounded-xl font-medium transition-all shadow-md"
+                >
+                  🌸 Add to ALL pages (random)
+                </button>
+                <button
                   onClick={() => {
                     if (!stickerUrl.trim()) return;
                     setShowStickerModal(false);
                     setPlacingMode(true);
                   }}
                   disabled={!stickerUrl.trim()}
-                  className="flex-1 bg-pink-500 hover:bg-pink-600 disabled:opacity-40 text-white py-3 rounded-xl font-medium transition-all shadow-md"
-                >
-                  🎯 Choose spot on page…
-                </button>
-                <button
-                  onClick={() => addStickerAt(35, 12)}
-                  disabled={!stickerUrl.trim()}
                   className="flex-1 bg-amber-600 hover:bg-amber-700 disabled:opacity-40 text-white py-3 rounded-xl font-medium transition-all shadow-md"
                 >
-                  ➕ Place in center
+                  🎯 Choose spot on page…
                 </button>
                 <button
                   onClick={() => { setShowStickerModal(false); setPlacingMode(false); }}
@@ -1425,10 +1510,11 @@ function App() {
                   const rect = e.currentTarget.getBoundingClientRect();
                   const xPct = ((e.clientX - rect.left) / rect.width) * 100;
                   const yPct = ((e.clientY - rect.top) / rect.height) * 100;
-                  addStickerAt(xPct, yPct);
+                  addStickerAt({ page: currentPage, xPct, yPct });
                 }}
               >
                 <div
+                  ref={pageNodeRef}
                   key={currentPage}
                   className={`a4-page page-flip-enter ${placingMode ? 'cursor-crosshair ring-4 ring-pink-400' : ''}`}
                   style={{
@@ -1461,12 +1547,14 @@ function App() {
                   {/* Footer band on EVERY page — both signatures */}
                   <LoveStoryFooter />
 
-                  {/* Stickers pinned to this page */}
+                  {/* Stickers on this page — pinned ones at their exact spot,
+                      scattered ones at the SAME deterministic position the PDF
+                      exporter will use (shared resolveStickerPlacements). */}
                   {stickersForCurrentPage.map((s) => (
                     <div
                       key={s.id}
                       className="diary-sticker"
-                      style={{ left: `${s.xPct}%`, top: `${s.yPct}%`, width: `${s.sizePct}%`, transform: `rotate(${s.rotate}deg)` }}
+                      style={stickerStyle(s)}
                       onClick={(e) => e.stopPropagation()}
                     >
                       <RobustImg src={s.url} alt="sticker" draggable={false} />

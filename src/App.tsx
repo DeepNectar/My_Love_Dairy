@@ -1,4 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
+import { supabase, DiaryEntry as SupabaseEntry } from './lib/supabase';
+import Auth from './components/Auth';
 
 interface DiaryEntry {
   id: string;
@@ -9,6 +11,7 @@ interface DiaryEntry {
 }
 
 function App() {
+  const [user, setUser] = useState<any>(null);
   const [entries, setEntries] = useState<DiaryEntry[]>([]);
   const [senderName, setSenderName] = useState('');
   const [message, setMessage] = useState('');
@@ -19,32 +22,69 @@ function App() {
   const [showImportModal, setShowImportModal] = useState(false);
   const [showMenu, setShowMenu] = useState(false);
   const [importStatus, setImportStatus] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  const [loading, setLoading] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
-  // Load entries from localStorage on mount
+  // Check auth state on mount
   useEffect(() => {
-    const saved = localStorage.getItem('diary-entries');
-    if (saved) {
-      setEntries(JSON.parse(saved));
-    }
-    const savedName = localStorage.getItem('diary-sender-name');
-    if (savedName) {
-      setSenderName(savedName);
-    }
+    checkUser();
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUser(session?.user ?? null);
+      if (session?.user) {
+        fetchEntries();
+        // Load sender name from user metadata
+        if (session.user.user_metadata?.full_name) {
+          setSenderName(session.user.user_metadata.full_name);
+        }
+      } else {
+        setEntries([]);
+      }
+    });
+
+    return () => subscription.unsubscribe();
   }, []);
 
-  // Save entries to localStorage whenever they change
+  // Fetch entries when user changes
   useEffect(() => {
-    localStorage.setItem('diary-entries', JSON.stringify(entries));
-  }, [entries]);
-
-  // Save sender name
-  useEffect(() => {
-    if (senderName) {
-      localStorage.setItem('diary-sender-name', senderName);
+    if (user) {
+      fetchEntries();
     }
-  }, [senderName]);
+  }, [user]);
+
+  const checkUser = async () => {
+    const { data: { user } } = await supabase.auth.getUser();
+    setUser(user);
+    if (user) {
+      fetchEntries();
+      if (user.user_metadata?.full_name) {
+        setSenderName(user.user_metadata.full_name);
+      }
+    }
+    setLoading(false);
+  };
+
+  const fetchEntries = async () => {
+    const { data, error } = await supabase
+      .from('diary_entries')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      console.error('Error fetching entries:', error);
+      setImportStatus({ type: 'error', message: 'Failed to load entries' });
+    } else {
+      setEntries(data.map(mapSupabaseEntry));
+    }
+  };
+
+  const mapSupabaseEntry = (entry: SupabaseEntry): DiaryEntry => ({
+    id: entry.id,
+    dateTime: entry.date_time,
+    senderName: entry.sender_name,
+    message: entry.message,
+    reflection: entry.reflection,
+  });
 
   // Close menu on outside click
   useEffect(() => {
@@ -76,28 +116,55 @@ function App() {
     });
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!message.trim() || !reflection.trim()) return;
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
+    setUser(null);
+    setEntries([]);
+  };
 
-    const newEntry: DiaryEntry = {
-      id: editingId || Date.now().toString(),
-      dateTime: getCurrentDateTime(),
-      senderName: senderName || 'Anonymous',
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!message.trim() || !reflection.trim() || !user) return;
+
+    const entryData = {
+      user_id: user.id,
+      date_time: getCurrentDateTime(),
+      sender_name: senderName || user.email || 'Anonymous',
       message: message.trim(),
       reflection: reflection.trim(),
     };
 
     if (editingId) {
-      setEntries(entries.map(entry => entry.id === editingId ? newEntry : entry));
-      setEditingId(null);
+      // Update existing entry
+      const { error } = await supabase
+        .from('diary_entries')
+        .update(entryData)
+        .eq('id', editingId);
+
+      if (error) {
+        setImportStatus({ type: 'error', message: 'Failed to update entry' });
+      } else {
+        setImportStatus({ type: 'success', message: 'Entry updated successfully!' });
+        fetchEntries();
+      }
     } else {
-      setEntries([newEntry, ...entries]);
+      // Insert new entry
+      const { error } = await supabase
+        .from('diary_entries')
+        .insert([entryData]);
+
+      if (error) {
+        setImportStatus({ type: 'error', message: 'Failed to save entry' });
+      } else {
+        setImportStatus({ type: 'success', message: 'Entry saved successfully!' });
+        fetchEntries();
+      }
     }
 
     setMessage('');
     setReflection('');
     setShowForm(false);
+    setEditingId(null);
   };
 
   const handleEdit = (entry: DiaryEntry) => {
@@ -108,9 +175,19 @@ function App() {
     setShowForm(true);
   };
 
-  const handleDelete = (id: string) => {
+  const handleDelete = async (id: string) => {
     if (window.confirm('Are you sure you want to delete this entry?')) {
-      setEntries(entries.filter(entry => entry.id !== id));
+      const { error } = await supabase
+        .from('diary_entries')
+        .delete()
+        .eq('id', id);
+
+      if (error) {
+        setImportStatus({ type: 'error', message: 'Failed to delete entry' });
+      } else {
+        setImportStatus({ type: 'success', message: 'Entry deleted successfully!' });
+        fetchEntries();
+      }
     }
   };
 
@@ -155,16 +232,14 @@ function App() {
     setImportStatus({ type: 'success', message: `Exported ${entries.length} entries as text!` });
   };
 
-  const parseTextEntries = (text: string): DiaryEntry[] => {
-    const parsed: DiaryEntry[] = [];
-    // Split by the separator "---" or double newlines between entries
+  const parseTextEntries = (text: string): Omit<DiaryEntry, 'id'>[] => {
+    const parsed: Omit<DiaryEntry, 'id'>[] = [];
     const blocks = text.split(/\n---\n|\n\n(?=Message:)/);
 
     for (const block of blocks) {
       const trimmed = block.trim();
       if (!trimmed) continue;
 
-      // Try to match the format: Message: [DateTime] - [Sender]: "[Content]"
       const messageRegex = /Message:\s*(.+?)\s*-\s*(.+?):\s*"(.+?)"/s;
       const messageMatch = trimmed.match(messageRegex);
 
@@ -173,14 +248,12 @@ function App() {
         const senderName = messageMatch[2].trim();
         const messageContent = messageMatch[3].trim();
 
-        // Try to match reflection
         const reflectionRegex = /What I felt:\s*(.+)/s;
         const reflectionMatch = trimmed.match(reflectionRegex);
         const reflectionContent = reflectionMatch ? reflectionMatch[1].trim() : '';
 
         if (messageContent) {
           parsed.push({
-            id: Date.now().toString() + Math.random().toString(36).substr(2, 9),
             dateTime,
             senderName,
             message: messageContent,
@@ -192,24 +265,22 @@ function App() {
     return parsed;
   };
 
-  const handleFileImport = (event: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileImport = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
-    if (!file) return;
+    if (!file || !user) return;
 
     const reader = new FileReader();
-    reader.onload = (e) => {
+    reader.onload = async (e) => {
       try {
         const content = e.target?.result as string;
-        let imported: DiaryEntry[] = [];
+        let imported: Omit<DiaryEntry, 'id'>[] = [];
 
         if (file.name.endsWith('.json')) {
-          // Parse JSON format
           const data = JSON.parse(content);
           if (Array.isArray(data)) {
             imported = data.map((item: any) => ({
-              id: item.id || Date.now().toString() + Math.random().toString(36).substr(2, 9),
-              dateTime: item.dateTime || 'Unknown date',
-              senderName: item.senderName || 'Anonymous',
+              dateTime: item.dateTime || item.date_time || 'Unknown date',
+              senderName: item.senderName || item.sender_name || 'Anonymous',
               message: item.message || '',
               reflection: item.reflection || '',
             }));
@@ -217,10 +288,9 @@ function App() {
             throw new Error('Invalid JSON format. Expected an array of entries.');
           }
         } else if (file.name.endsWith('.txt') || file.name.endsWith('.md')) {
-          // Parse text format
           imported = parseTextEntries(content);
           if (imported.length === 0) {
-            throw new Error('Could not parse any entries from this text file. Make sure it follows the format:\n\nMessage: [Date & Time] - [Sender Name]: "[Message content]"\nWhat I felt: [Original reflection]');
+            throw new Error('Could not parse any entries from this text file.');
           }
         } else {
           throw new Error('Unsupported file format. Please use .json or .txt files.');
@@ -230,9 +300,24 @@ function App() {
           throw new Error('No valid entries found in the file.');
         }
 
-        setEntries([...imported, ...entries]);
+        // Insert all entries to Supabase
+        const entriesToInsert = imported.map(entry => ({
+          user_id: user.id,
+          date_time: entry.dateTime,
+          sender_name: entry.senderName,
+          message: entry.message,
+          reflection: entry.reflection,
+        }));
+
+        const { error } = await supabase
+          .from('diary_entries')
+          .insert(entriesToInsert);
+
+        if (error) throw error;
+
         setShowImportModal(false);
         setImportStatus({ type: 'success', message: `Successfully imported ${imported.length} ${imported.length === 1 ? 'entry' : 'entries'}!` });
+        fetchEntries();
       } catch (err: any) {
         setImportStatus({ type: 'error', message: err.message || 'Failed to import file.' });
       }
@@ -242,7 +327,6 @@ function App() {
     };
     reader.readAsText(file);
 
-    // Reset file input
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
@@ -258,6 +342,23 @@ function App() {
     entry.reflection.toLowerCase().includes(searchQuery.toLowerCase()) ||
     entry.senderName.toLowerCase().includes(searchQuery.toLowerCase())
   );
+
+  // Show loading state
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-gradient-to-br from-amber-50 via-orange-50 to-yellow-50 flex items-center justify-center">
+        <div className="text-center">
+          <div className="text-5xl mb-4 animate-pulse">📖</div>
+          <p className="text-amber-700">Loading your diary...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // Show auth if not logged in
+  if (!user) {
+    return <Auth onAuthSuccess={() => {}} />;
+  }
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-amber-50 via-orange-50 to-yellow-50">
@@ -279,7 +380,7 @@ function App() {
             <span className="text-3xl">📖</span>
             <div>
               <h1 className="text-2xl font-bold text-amber-900 font-serif">My Diary</h1>
-              <p className="text-sm text-amber-700">Journal your thoughts & reflections</p>
+              <p className="text-sm text-amber-700">Cloud-synced journal</p>
             </div>
           </div>
           <div className="flex items-center gap-2">
@@ -329,6 +430,17 @@ function App() {
                     <div>
                       <p className="font-medium text-gray-800">Export as Text</p>
                       <p className="text-xs text-gray-500">Readable diary format</p>
+                    </div>
+                  </button>
+                  <div className="border-t border-amber-100"></div>
+                  <button
+                    onClick={handleLogout}
+                    className="w-full px-4 py-3 text-left hover:bg-red-50 flex items-center gap-3 transition-colors text-red-600"
+                  >
+                    <span className="text-lg">🚪</span>
+                    <div>
+                      <p className="font-medium">Log Out</p>
+                      <p className="text-xs text-gray-500">{user.email}</p>
                     </div>
                   </button>
                 </div>
@@ -624,7 +736,7 @@ function App() {
 
       {/* Footer */}
       <footer className="text-center py-6 text-amber-600 text-sm">
-        <p>Your diary entries are stored locally in your browser 🔒</p>
+        <p>Your diary entries are synced to the cloud ☁️ 🔒</p>
       </footer>
     </div>
   );

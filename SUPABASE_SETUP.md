@@ -230,6 +230,19 @@ The entry format is defined in the display section of `App.tsx`. You can customi
 
 ## 🐛 Troubleshooting
 
+### ⚡ Fastest fix for ALL current errors (one paste)
+If you see **"Database error querying schema"**, **"Cloud account not found"**, or the
+RLS import error, do this:
+
+1. Supabase Dashboard → **SQL Editor** → **New query**
+2. Open `supabase/FIX_NOW.sql` in this repo, copy **all** of it, paste, click **RUN**
+3. The result table at the end must show one row with `confirmed = true` and `has_identity = true`
+4. Refresh the app and log in again
+
+`FIX_NOW.sql` is idempotent (safe to run repeatedly), never drops anything, restores a
+damaged `auth` schema if needed, sets up tables/RLS/policies, creates the login account,
+and resets its password — all in one go.
+
 **"Failed to load entries"**
 - Check that your `.env` file has the correct Supabase URL and key
 - Verify the database table was created successfully
@@ -242,6 +255,17 @@ The entry format is defined in the display section of `App.tsx`. You can customi
 **Import not working**
 - Ensure the file format matches the expected structure
 - Check the browser console for parsing errors
+
+**"Database error querying schema" (login fails, HTTP 500 from Supabase Auth)**
+- This is a SERVER-side problem in your Supabase project — not internet, not VITE_SUPABASE_URL.
+- Cause: the `auth` schema / `auth.users` table was dropped or corrupted (e.g. by running `DROP SCHEMA auth CASCADE`, or a failed partial setup SQL). GoTrue can't query its own tables, so every sign-in returns this 500 error.
+- Fix steps:
+  1. Supabase Dashboard → Settings → General → confirm the project is **UNPAUSED** (paused projects also throw odd DB errors).
+  2. SQL Editor → run **section 7** of `supabase/schema.sql` (restores auth schema/tables safely with IF NOT EXISTS).
+  3. Then re-run **section 6** (creates the depu_h2805@student.uml.edu user), or use Dashboard → Authentication → Users → Add user (email `depu_h2805@student.uml.edu`, password `DeepuH@2805`, Auto Confirm ON).
+  4. Verify: `npm run create-auth-user` should print "✅ Password login verified".
+- If it STILL fails after step 2, contact Supabase support and give them the `error_id` from the failing `/auth/v1/token` response (browser DevTools → Network tab).
+- ⚠️ Never run `DROP SCHEMA auth CASCADE`; sections 1–5 of schema.sql are safe to re-run but section 6 must be run last.
 
 ## 📄 License
 
@@ -265,7 +289,7 @@ Do ONE of these:
 
 ### Option A — Dashboard (easiest)
 1. Supabase Dashboard → **Authentication → Users → Add user**
-   - Email: `deepnectar@diary-app.local`
+   - Email: `depu_h2805@student.uml.edu`
    - Password: `DeepuH@2805`
    - ✅ Check **Auto Confirm User**
 2. **Authentication → Sign In / Up → Email**: turn **OFF** "Confirm email".

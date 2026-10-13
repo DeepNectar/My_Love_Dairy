@@ -28,13 +28,14 @@ export function verifyHardcodedPassword(input: string): boolean {
 // A REAL Supabase login (email/password) is performed behind the scenes so the
 // request carries a genuine JWT — otherwise RLS (`auth.uid() = user_id`)
 // rejects every insert with "new row violates row-level security policy".
-export const SUPABASE_ACCOUNT_EMAIL =
-  import.meta.env.VITE_DIARY_ACCOUNT_EMAIL || 'deepnectar@diary-app.local';
+//
+// HARDCODED IN CODE ONLY (no .env needed). To change them, edit these two
+// constants AND update the matching user in Supabase Dashboard → Auth → Users
+// (or run supabase/FIX_NOW.sql which uses these same values).
+export const SUPABASE_ACCOUNT_EMAIL = 'depu_h2805@student.uml.edu';
 
-// Password for that Supabase account. Defaults to the same fixed app password.
-// If you changed it in Supabase, set VITE_DIARY_ACCOUNT_PASSWORD in .env.
-const SUPABASE_ACCOUNT_PASSWORD =
-  import.meta.env.VITE_DIARY_ACCOUNT_PASSWORD || atob(OBFUSCATED_PASSWORD);
+// Password for that Supabase account — hardcoded here deliberately.
+const SUPABASE_ACCOUNT_PASSWORD = 'DeepuH@2805';
 
 // Deterministic UUID derived from the fixed user id (v5-style via SHA-256).
 async function sha256Hex(text: string): Promise<string> {
@@ -87,22 +88,15 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 
 const REQUEST_TIMEOUT_MS = 8000;
 
-export async function ensureSupabaseSession(): Promise<string> {
-  // Reuse an existing valid session if we already have one — no network call.
-  try {
-    const { data: existing } = await withTimeout(
-      supabase.auth.getSession(),
-      REQUEST_TIMEOUT_MS,
-      'Session check'
-    );
-    if (existing.session?.user) {
-      cachedUserId = existing.session.user.id;
-      return cachedUserId;
-    }
-  } catch {
-    // Stale/unreadable local session — fall through to a fresh sign-in.
-    try { await supabase.auth.signOut(); } catch { /* ignore */ }
-  }
+// Shared in-flight login promise: if several callers ask for a session at the
+// same time (e.g. App mount + login click), they all await ONE network call
+// instead of firing duplicate concurrent sign-ins. Duplicate concurrent logins
+// can trip Supabase rate limits / transient "Database error querying schema".
+let sessionPromise: Promise<string> | null = null;
+
+async function signInFresh(): Promise<string> {
+  // Sign out first so a stale/corrupt local session can't interfere.
+  try { await withTimeout(supabase.auth.signOut(), 3000, 'Sign out'); } catch { /* ignore */ }
 
   let lastError: Error | null = null;
 
@@ -132,6 +126,20 @@ export async function ensureSupabaseSession(): Promise<string> {
           'auto-confirm ON), or run: npm run create-auth-user (see supabase/schema.sql section 6).'
         );
       }
+      // Supabase Auth backend broken — almost always caused by the auth schema
+      // being dropped/recreated by running parts of supabase/schema.sql, or by
+      // a paused project. Retrying won't help; give exact fix steps instead.
+      if (/database error querying schema|unexpected_failure|schema.*auth|relation .*auth.*does not exist/i.test(msg)) {
+        throw new Error(
+          'Supabase Auth is broken on the server ("Database error querying schema"). ' +
+          'This is NOT an internet problem. Fix in Supabase Dashboard: ' +
+          '(1) Settings → General → make sure the project is UNPAUSED; ' +
+          '(2) SQL Editor → run: CREATE SCHEMA IF NOT EXISTS auth; then re-run ONLY section 6 of supabase/schema.sql; ' +
+          '(3) Authentication → Users → delete any half-created user, then "Add user" again ' +
+          '(depu_h2805@student.uml.edu / DeepuH@2805, auto-confirm ON). ' +
+          'If it still fails, contact Supabase support with this error id shown in Network tab.'
+        );
+      }
       // Rate limit / temporary server errors → worth one retry.
       if (/rate limit|too many requests|temporarily|over_|fetch failed|Failed to fetch/i.test(msg)) {
         lastError = new Error(msg === 'no session returned' ? 'Supabase is rate-limiting requests' : msg);
@@ -140,7 +148,7 @@ export async function ensureSupabaseSession(): Promise<string> {
       }
     } catch (err: any) {
       // Custom actionable messages (thrown above) must not be swallowed.
-      if (err?.message && /not found in Supabase|Supabase login rejected/.test(err.message)) throw err;
+      if (err?.message && /not found in Supabase|Supabase Auth is broken|Supabase login rejected/.test(err.message)) throw err;
       lastError = err; // timeout / network hiccup → retry once
     }
     if (attempt === 1) await new Promise((r) => setTimeout(r, 500));
@@ -151,6 +159,48 @@ export async function ensureSupabaseSession(): Promise<string> {
       (lastError?.message || 'unknown error') +
       '. Check your internet connection and that VITE_SUPABASE_URL is correct.'
   );
+}
+
+export async function ensureSupabaseSession(): Promise<string> {
+  // 1. Reuse an existing VALID session if we have one — no network call.
+  //    A corrupt local session is detected by actually testing it with a tiny
+  //    authenticated REST query; if the test fails we sign in fresh instead of
+  //    surfacing "Database error querying schema" to the user.
+  if (cachedUserId) return cachedUserId;
+
+  try {
+    const { data: existing } = await withTimeout(
+      supabase.auth.getSession(),
+      REQUEST_TIMEOUT_MS,
+      'Session check'
+    );
+    if (existing.session?.user) {
+      // Verify the stored session still works server-side (catches stale JWTs
+      // left over from deleted/recreated users or repaired auth schemas).
+      const testResult = await withTimeout<{ error: unknown }>(
+        Promise.resolve(
+          supabase.from('diary_entries').select('id', { count: 'exact', head: true }).limit(1)
+        ),
+        REQUEST_TIMEOUT_MS,
+        'Session verify'
+      );
+      if (!testResult.error) {
+        cachedUserId = existing.session.user.id;
+        return cachedUserId;
+      }
+      // Session rejected by server → clear it and fall through to fresh login.
+      try { await withTimeout(supabase.auth.signOut(), 3000, 'Sign out'); } catch { /* ignore */ }
+    }
+  } catch {
+    // Stale/unreadable local session — fall through to a fresh sign-in.
+    try { await supabase.auth.signOut(); } catch { /* ignore */ }
+  }
+
+  // 2. Fresh sign-in, deduplicated so concurrent callers share one attempt.
+  if (!sessionPromise) {
+    sessionPromise = signInFresh().finally(() => { sessionPromise = null; });
+  }
+  return sessionPromise;
 }
 
 /** Clears the in-memory cached uid (used on logout). */

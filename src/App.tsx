@@ -569,6 +569,12 @@ function App() {
   // the live DOM at true print size. The SAME pages drive the on-screen
   // sheet and the exported PDF, so nothing overflows and no page is left
   // with big empty gaps.
+  //
+  // IMPORTANT: block heights are measured from an OFF-SCREEN host that is
+  // laid out exactly like `.a4-print-area` (same width/font/line-height).
+  // We never measure inside the visible flex sheet — its children can be
+  // shrunk/clipped there, which under-reported heights and made overflowing
+  // data vanish instead of flowing onto the next page.
   // =====================================================================
   const flowHostRef = useRef<HTMLDivElement>(null);
   const [flowPages, setFlowPages] = useState<{ key: string; html: string; height: number; sliceTop?: number }[][]>([]);
@@ -667,12 +673,34 @@ function App() {
         height: Math.max(el.scrollHeight, el.offsetHeight),
       }));
 
-      // Available content height inside one A4 sheet:
+      // Available content height inside one A4 sheet — measured from the REAL
+      // header/footer bands at print width (same numbers the PDF exporter
+      // uses, so on-screen pages and PDF sheets stay identical):
       //   sheet − narrow margins − header band − footer band − page-number reserve
       const headerEl = document.getElementById('ls-header-measure');
       const footerEl = document.getElementById('ls-footer-measure');
-      const headerH = headerEl ? headerEl.offsetHeight : Math.round(34 * PX_PER_MM);
-      const footerH = footerEl ? footerEl.offsetHeight : Math.round(22 * PX_PER_MM);
+      if (headerEl) await Promise.all(
+        Array.from(headerEl.querySelectorAll('img')).map(
+          (img) =>
+            new Promise<void>((resolve) => {
+              if ((img as HTMLImageElement).complete && (img as HTMLImageElement).naturalWidth > 0) return resolve();
+              img.onload = () => resolve();
+              img.onerror = () => resolve();
+            })
+        )
+      );
+      if (footerEl) await Promise.all(
+        Array.from(footerEl.querySelectorAll('img')).map(
+          (img) =>
+            new Promise<void>((resolve) => {
+              if ((img as HTMLImageElement).complete && (img as HTMLImageElement).naturalWidth > 0) return resolve();
+              img.onload = () => resolve();
+              img.onerror = () => resolve();
+            })
+        )
+      );
+      const headerH = headerEl ? Math.max(headerEl.offsetHeight, headerEl.scrollHeight) : Math.round(34 * PX_PER_MM);
+      const footerH = footerEl ? Math.max(footerEl.offsetHeight, footerEl.scrollHeight) : Math.round(22 * PX_PER_MM);
       const MARGIN = Math.round(8 * PX_PER_MM);
       const PAGE_H = Math.round(297 * PX_PER_MM);
       const gap = Math.round(2 * PX_PER_MM);
@@ -719,26 +747,49 @@ function App() {
   // Re-pack once the header/footer images finish loading (their height depends on aspect ratio)
   useEffect(() => {
     let cancelled = false;
-    const t = setTimeout(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const check = () => {
+      if (cancelled) return;
       const imgs = [
         ...(document.getElementById('ls-header-measure')?.querySelectorAll('img') ?? []),
         ...(document.getElementById('ls-footer-measure')?.querySelectorAll('img') ?? []),
       ] as HTMLImageElement[];
       if (!imgs.length) return;
-      Promise.all(
-        imgs.map(
-          (img) =>
-            new Promise<void>((resolve) => {
-              if (img.complete && img.naturalWidth > 0) return resolve();
-              img.onload = () => resolve();
-              img.onerror = () => resolve();
-            })
-        )
-      ).then(() => {
-        if (!cancelled) setFlowTick((x) => x + 1);
-      });
-    }, 400);
-    return () => { cancelled = true; clearTimeout(t); };
+      const allSettled = imgs.every((im) => im.complete);
+      if (allSettled) {
+        // Band heights changed → re-run pagination with final measurements.
+        setFlowTick((x) => x + 1);
+      } else {
+        timer = setTimeout(check, 500);
+      }
+    };
+    timer = setTimeout(check, 600);
+    return () => { cancelled = true; if (timer) clearTimeout(timer); };
+  }, []);
+
+  // Robustness net: if any content image is still swapping fallback URLs late
+  // (slow Drive links), its `load`/`error` event triggers ONE final re-pack so
+  // page heights are never stale — overflowing data always flows onto the next
+  // page instead of being clipped out of existence. Bounded to avoid loops.
+  const imgRepacksRef = useRef(0);
+  useEffect(() => {
+    let cancelled = false;
+    const seen = new Set<HTMLImageElement>();
+    const onImgDone = (e: Event) => {
+      const img = e.target as HTMLImageElement;
+      if (!(img instanceof HTMLImageElement)) return;
+      if (cancelled || imgRepacksRef.current >= 6 || seen.has(img)) return;
+      seen.add(img);
+      imgRepacksRef.current += 1;
+      setFlowTick((x) => x + 1);
+    };
+    document.addEventListener('load', onImgDone, true);
+    document.addEventListener('error', onImgDone, true);
+    return () => {
+      cancelled = true;
+      document.removeEventListener('load', onImgDone, true);
+      document.removeEventListener('error', onImgDone, true);
+    };
   }, []);
 
   const totalPages = Math.max(flowPages.length, 1);
@@ -1505,8 +1556,12 @@ function App() {
             ))}
           </div>
 
-          {/* live measurement host for the paginator */}
-          <div ref={flowHostRef} style={{ width: `${CONTENT_W_CSS}px`, fontSize: '10pt', lineHeight: 1.45, color: '#3f2a12' }} />
+          {/* live measurement host for the paginator — styled EXACTLY like
+              .a4-print-area so measured heights match what the sheet renders */}
+          <div
+            ref={flowHostRef}
+            style={{ width: `${CONTENT_W_CSS}px`, fontSize: '10pt', lineHeight: 1.45, color: '#3f2a12', background: '#ffffff' }}
+          />
         </div>
       )}
 

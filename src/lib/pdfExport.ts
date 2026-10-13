@@ -119,6 +119,30 @@ function sliceOversized(block: MeasuredBlock, maxH: number): MeasuredBlock[] {
   return out.length ? out : [block];
 }
 
+/**
+ * Safety net for sliced oversized blocks: a clone rendered inside an SVG
+ * foreignObject can grow/shrink by a few pixels compared to the live DOM
+ * (font substitution, rounding). If a slice's natural height exceeds the
+ * window it was given, shift the crop offset a bit further so the visible
+ * window always fits the page — content is never cut off at the bottom and
+ * never spills into the footer band.
+ */
+function fitSlicedBlock(el: HTMLElement, targetH: number, maxExtra: number): void {
+  if (!el.style || el.style.top === '') return; // only applies to slice wrappers
+  let currentTop = parseFloat(el.style.top) || 0;
+  const origTop = currentTop;
+  let guard = 0;
+  while (guard++ < 60 && el.scrollHeight > targetH + 1 && -currentTop < maxExtra) {
+    currentTop -= Math.ceil(el.scrollHeight - targetH);
+    el.style.top = `${currentTop}px`;
+  }
+  // Never shift the crop so far that the top of the window goes blank.
+  if (el.firstElementChild instanceof HTMLElement && el.firstElementChild.offsetHeight < targetH) {
+    currentTop = origTop;
+    el.style.top = `${currentTop}px`;
+  }
+}
+
 /** Re-flow measured blocks into A4 sheets — greedy fill, nothing dropped. */
 export function flowIntoPages(blocks: MeasuredBlock[], availableHeightCss: number): MeasuredBlock[][] {
   const maxH = availableHeightCss;
@@ -202,16 +226,37 @@ function inlineComputedStyles(root: HTMLElement): string {
  * Snapshot a DOM node into an SVG rendered by the browser's native SVG engine.
  * Throws only if the browser itself refuses to decode the SVG (logged for debug).
  */
-async function rasterizeNode(el: HTMLElement, widthCss: number): Promise<{ canvas: HTMLCanvasElement; heightCss: number }> {
-  const heightCss = el.offsetHeight || el.scrollHeight;
+async function rasterizeNode(
+  el: HTMLElement,
+  widthCss: number,
+  opts?: { heightOverride?: number },
+): Promise<{ canvas: HTMLCanvasElement; heightCss: number }> {
+  const isSlice = typeof opts?.heightOverride === 'number';
+  const heightCss = isSlice ? (opts as { heightOverride: number }).heightOverride : el.offsetHeight || el.scrollHeight;
   const clone = el.cloneNode(true) as HTMLElement;
   clone.style.width = `${widthCss}px`;
-  clone.style.height = 'auto';
-  clone.style.maxHeight = 'none';
-  clone.style.position = 'static';
-  clone.style.transform = 'none';
-  clone.style.margin = '0';
-  clone.style.overflow = 'visible';
+  if (isSlice) {
+    // Slice wrapper: keep the fixed-height clipping window EXACTLY as the
+    // on-screen paginator created it. The old code forced height:auto /
+    // overflow:visible here, which made every cropped block render at its
+    // FULL height — that is what pushed text past the page bottom into the
+    // footer band and produced "missing data" in the exported PDF.
+    clone.style.height = `${heightCss}px`;
+    clone.style.maxHeight = `${heightCss}px`;
+    clone.style.overflow = 'hidden';
+    clone.style.boxSizing = 'border-box';
+    clone.style.position = 'relative';
+    clone.style.transform = 'none';
+    clone.style.margin = '0';
+    fitSlicedBlock(clone, heightCss, Math.round(15 * CSS_PX_PER_MM));
+  } else {
+    clone.style.height = 'auto';
+    clone.style.maxHeight = 'none';
+    clone.style.position = 'static';
+    clone.style.transform = 'none';
+    clone.style.margin = '0';
+    clone.style.overflow = 'visible';
+  }
 
   const inner = inlineComputedStyles(clone);
   const svg =
@@ -235,6 +280,9 @@ async function rasterizeNode(el: HTMLElement, widthCss: number): Promise<{ canva
 
   const canvas = document.createElement('canvas');
   canvas.width = Math.round(widthCss * PRINT_SCALE);
+  // The SVG viewport height is the trusted layout height (slice windows use
+  // their exact slice height), so the canvas must match it — using the img's
+  // natural size here could introduce a mismatch that shifts drawn content.
   canvas.height = Math.max(1, Math.round(heightCss * PRINT_SCALE));
   const ctx = canvas.getContext('2d')!;
   ctx.fillStyle = '#ffffff';
@@ -243,10 +291,50 @@ async function rasterizeNode(el: HTMLElement, widthCss: number): Promise<{ canva
   return { canvas, heightCss };
 }
 
+/** Wait until every <img> inside `root` has settled (loaded or failed). */
+async function waitForImages(root: HTMLElement) {
+  const imgs = Array.from(root.querySelectorAll('img'));
+  await Promise.all(
+    imgs.map(
+      (img) =>
+        new Promise<void>((resolve) => {
+          if (img.complete && img.naturalWidth > 0) return resolve();
+          img.onload = () => resolve();
+          img.onerror = () => resolve();
+        })
+    )
+  );
+}
+
 /** Rasterize a single content block straight from the live DOM node. */
 async function rasterizeBlock(b: MeasuredBlock): Promise<HTMLCanvasElement> {
-  const { canvas } = await rasterizeNode(b.el, CONTENT_W_CSS);
+  // Slice wrappers (fixed-height crop windows) must be rendered with their
+  // exact window height — see rasterizeNode's `heightOverride` path.
+  const isSlice = b.el.style.height !== '' && parseFloat(b.el.style.top || '') < 0;
+  const { canvas } = await rasterizeNode(b.el, CONTENT_W_CSS, isSlice ? { heightOverride: b.height } : undefined);
   return canvas;
+}
+
+/**
+ * Measure a container's true content height without letting flex children
+ * shrink. `.a4-print-area { flex:1; min-height:0 }` silently clips whatever
+ * doesn't fit, so offsetHeight of such nodes lies about overflow — exactly
+ * how overflowing data used to vanish from the PDF instead of flowing onto
+ * the next page. Temporarily neutralising the flex constraints exposes the
+ * real scrollHeight, then everything is restored.
+ */
+function measureTrueHeight(el: HTMLElement): number {
+  const prevFlex = el.style.flex;
+  const prevMinH = el.style.minHeight;
+  const prevOverflow = el.style.overflow;
+  el.style.flex = '0 0 auto';
+  el.style.minHeight = '0';
+  el.style.overflow = 'visible';
+  const h = Math.max(el.scrollHeight, el.offsetHeight);
+  el.style.flex = prevFlex;
+  el.style.minHeight = prevMinH;
+  el.style.overflow = prevOverflow;
+  return h;
 }
 
 export async function exportDiaryToA4Pdf(opts: PdfOptions): Promise<number> {
@@ -257,7 +345,13 @@ export async function exportDiaryToA4Pdf(opts: PdfOptions): Promise<number> {
   await inlineImages(container);
   for (const band of opts.bands ?? []) {
     const node = document.getElementById(band.nodeId);
-    if (node) await inlineImages(node);
+    if (node) {
+      await inlineImages(node);
+      // The header photo / signature heights decide how much space is left on
+      // every sheet — measure only AFTER those images have settled, otherwise
+      // a too-small band height makes content overflow the page bottom.
+      await waitForImages(node);
+    }
   }
   // Wait for web fonts to finish loading — text measured mid font-swap has
   // the wrong height, which makes pages overflow in the exported PDF.
@@ -290,26 +384,31 @@ export async function exportDiaryToA4Pdf(opts: PdfOptions): Promise<number> {
   if (pageNodes.length > 0) {
     pages = [];
     for (const pn of pageNodes) {
-      const blocks = measureBlocks(pn);
-      let h = 0;
-      let cur: MeasuredBlock[] = [];
-      for (const b of blocks) {
-        if (h + b.height > availableCss && cur.length) {
-          pages.push(cur);
-          cur = [];
-          h = 0;
-        }
-        cur.push(b);
-        h += b.height;
+      // flowIntoPages re-slices any block taller than one printable area and
+      // pushes every remaining slice to the NEXT page — data that doesn't fit
+      // always continues on a following sheet instead of being clipped away.
+      for (const sub of flowIntoPages(measureBlocks(pn), Math.max(availableCss, 100))) {
+        pages.push(sub);
       }
-      if (cur.length) pages.push(cur);
     }
     if (pages.length === 0) pages.push([]);
   } else {
-    const blocks = measureBlocks(container);
+    // Fallback path: no pre-paginated structure — measure the raw children at
+    // their TRUE height (never trusting flex-shrunk offsetHeight, which hides
+    // overflowing content) and flow them across as many sheets as needed.
+    const blocks = measureBlocks(container).map((b) => ({ el: b.el, height: measureTrueHeight(b.el) || b.height }));
     if (blocks.length === 0) throw new Error('No content found to export.');
     pages = flowIntoPages(blocks, Math.max(availableCss, 100));
   }
+
+  // Final safety net: if any page's blocks STILL exceed one printable area
+  // (e.g. late font swap made measurements stale after packing), re-flow it
+  // so nothing spills past the sheet edge or under the footer band.
+  pages = pages.flatMap((pg) => {
+    const total = pg.reduce((s, b) => s + b.height, 0);
+    if (total > availableCss && pg.length > 0) return flowIntoPages(pg, Math.max(availableCss, 100));
+    return [pg];
+  });
 
   const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4', compress: true });
 
@@ -331,7 +430,17 @@ export async function exportDiaryToA4Pdf(opts: PdfOptions): Promise<number> {
 
     for (const b of pages[i]) {
       const bc = await rasterizeBlock(b);
-      ctx.drawImage(bc, MARGIN_CSS * S, y, CONTENT_W_CSS * S, b.height * S);
+      // Hard guarantee: content is NEVER drawn into the footer band's zone.
+      // If a block still reaches past the printable area (stale measurement),
+      // only its fitting part is painted here; the re-flow above already put
+      // the remainder on a following sheet, so nothing is silently lost.
+      const footerTopY = bottomBand
+        ? SHEET_H_CSS - MARGIN_CSS - bottomBand.heightCss
+        : SHEET_H_CSS - MARGIN_CSS - PAGE_NUMBER_RESERVE_CSS;
+      const drawH = Math.min(b.height, Math.max(0, footerTopY - y / S));
+      if (drawH > 1) {
+        ctx.drawImage(bc, MARGIN_CSS * S, y, CONTENT_W_CSS * S, drawH * S);
+      }
       y += b.height * S;
       await wait(0);
     }

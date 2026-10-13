@@ -88,22 +88,15 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 
 const REQUEST_TIMEOUT_MS = 8000;
 
-export async function ensureSupabaseSession(): Promise<string> {
-  // Reuse an existing valid session if we already have one — no network call.
-  try {
-    const { data: existing } = await withTimeout(
-      supabase.auth.getSession(),
-      REQUEST_TIMEOUT_MS,
-      'Session check'
-    );
-    if (existing.session?.user) {
-      cachedUserId = existing.session.user.id;
-      return cachedUserId;
-    }
-  } catch {
-    // Stale/unreadable local session — fall through to a fresh sign-in.
-    try { await supabase.auth.signOut(); } catch { /* ignore */ }
-  }
+// Shared in-flight login promise: if several callers ask for a session at the
+// same time (e.g. App mount + login click), they all await ONE network call
+// instead of firing duplicate concurrent sign-ins. Duplicate concurrent logins
+// can trip Supabase rate limits / transient "Database error querying schema".
+let sessionPromise: Promise<string> | null = null;
+
+async function signInFresh(): Promise<string> {
+  // Sign out first so a stale/corrupt local session can't interfere.
+  try { await withTimeout(supabase.auth.signOut(), 3000, 'Sign out'); } catch { /* ignore */ }
 
   let lastError: Error | null = null;
 
@@ -166,6 +159,46 @@ export async function ensureSupabaseSession(): Promise<string> {
       (lastError?.message || 'unknown error') +
       '. Check your internet connection and that VITE_SUPABASE_URL is correct.'
   );
+}
+
+export async function ensureSupabaseSession(): Promise<string> {
+  // 1. Reuse an existing VALID session if we have one — no network call.
+  //    A corrupt local session is detected by actually testing it with a tiny
+  //    authenticated REST query; if the test fails we sign in fresh instead of
+  //    surfacing "Database error querying schema" to the user.
+  if (cachedUserId) return cachedUserId;
+
+  try {
+    const { data: existing } = await withTimeout(
+      supabase.auth.getSession(),
+      REQUEST_TIMEOUT_MS,
+      'Session check'
+    );
+    if (existing.session?.user) {
+      // Verify the stored session still works server-side (catches stale JWTs
+      // left over from deleted/recreated users or repaired auth schemas).
+      const testResult = await withTimeout<{ error: unknown }>(
+        supabase.from('diary_entries').select('id', { count: 'exact', head: true }).limit(1),
+        REQUEST_TIMEOUT_MS,
+        'Session verify'
+      );
+      if (!testResult.error) {
+        cachedUserId = existing.session.user.id;
+        return cachedUserId;
+      }
+      // Session rejected by server → clear it and fall through to fresh login.
+      try { await withTimeout(supabase.auth.signOut(), 3000, 'Sign out'); } catch { /* ignore */ }
+    }
+  } catch {
+    // Stale/unreadable local session — fall through to a fresh sign-in.
+    try { await supabase.auth.signOut(); } catch { /* ignore */ }
+  }
+
+  // 2. Fresh sign-in, deduplicated so concurrent callers share one attempt.
+  if (!sessionPromise) {
+    sessionPromise = signInFresh().finally(() => { sessionPromise = null; });
+  }
+  return sessionPromise;
 }
 
 /** Clears the in-memory cached uid (used on logout). */

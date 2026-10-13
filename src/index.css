@@ -1,7 +1,8 @@
 @import "tailwindcss";
 
 /* ============ A4 page (site + PDF) ============ */
-/* Exact ISO A4 aspect ratio: 210mm x 297mm. Narrow margins (10mm). */
+/* Exact ISO A4: 210mm x 297mm. Narrow margins (8mm). The sheet is laid out at
+   true CSS size and scaled with transform — so what you see is what prints. */
 .a4-sheet {
   width: min(210mm, 96vw);
   height: min(297mm, calc(96vw * 297 / 210));
@@ -15,7 +16,7 @@
 .a4-page {
   width: 210mm;
   height: 297mm;
-  padding: 10mm; /* narrow margin — same in the exported PDF */
+  padding: 8mm;                 /* narrow margin — identical in the exported PDF */
   box-sizing: border-box;
   position: absolute;
   top: 0;
@@ -38,7 +39,7 @@
 
 .a4-page-number {
   position: absolute;
-  bottom: 4mm;
+  bottom: 3mm;
   right: 6mm;
   font-size: 9pt;
   color: #92400e;
@@ -54,6 +55,87 @@
   to   { opacity: 1; transform: translateX(0) rotateY(0deg); }
 }
 
+/* ============ 💕 OUR LOVE STORY — header band on every A4 page ============ */
+.ls-header {
+  display: flex;
+  align-items: stretch;
+  gap: 3mm;
+  border-bottom: 2.5px solid #f43f5e;
+  padding-bottom: 2mm;
+  margin-bottom: 2mm;
+  break-after: avoid;
+}
+.ls-header-photo {
+  flex: 0 0 auto;
+  width: 26mm;
+  height: 26mm;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 2px solid #fb7185;
+  box-shadow: 0 2px 6px rgba(190, 24, 93, 0.25);
+  background: #fff1f2;
+}
+.ls-header-photo img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.ls-header-text { flex: 1 1 auto; min-width: 0; text-align: center; }
+.ls-title {
+  font-family: Georgia, 'Times New Roman', serif;
+  font-size: 15pt;
+  font-weight: 800;
+  margin: 0 0 1mm;
+  color: #be123c;
+  letter-spacing: 0.5px;
+}
+.ls-sub {
+  font-size: 9.5pt;
+  font-weight: 700;
+  color: #9d174d;
+  margin: 0 0 0.8mm;
+  line-height: 1.3;
+}
+.ls-meta {
+  font-size: 8.5pt;
+  color: #b45309;
+  margin: 0 0 0.8mm;
+  line-height: 1.3;
+}
+.ls-quote {
+  font-size: 8.5pt;
+  font-style: italic;
+  color: #6d28d9;
+  margin: 0;
+  line-height: 1.3;
+}
+.ls-dash { color: #f59e0b; font-weight: 800; }
+
+/* ============ Footer band — both signatures on every A4 page ============ */
+.ls-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 6mm;
+  border-top: 1.5px dashed #fda4af;
+  padding-top: 1.5mm;
+  margin-top: 2mm;
+  break-before: avoid;
+}
+.ls-sign {
+  flex: 0 1 auto;
+  max-width: 62mm;
+  text-align: center;
+}
+.ls-sign img {
+  max-height: 17mm;
+  max-width: 100%;
+  width: auto;
+  display: block;
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.15));
+}
+
 /* Sticker-style images placed anywhere on the page */
 .diary-sticker {
   position: absolute;
@@ -62,6 +144,7 @@
   user-select: none;
   filter: drop-shadow(0 3px 6px rgba(0, 0, 0, 0.3));
   transition: transform 0.15s ease;
+  z-index: 3;
 }
 .diary-sticker:hover { transform: scale(1.05) rotate(0deg) !important; }
 .diary-sticker img {
@@ -149,45 +232,18 @@
 }
 
 @keyframes fade-in {
-  from {
-    opacity: 0;
-    transform: translateY(-10px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
+  from { opacity: 0; transform: translateY(-10px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
-
-.animate-fade-in {
-  animation: fade-in 0.3s ease-out;
-}
+.animate-fade-in { animation: fade-in 0.3s ease-out; }
 
 /* Custom scrollbar */
-::-webkit-scrollbar {
-  width: 8px;
-}
+::-webkit-scrollbar { width: 8px; }
+::-webkit-scrollbar-track { background: #fef3c7; }
+::-webkit-scrollbar-thumb { background: #d97706; border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: #b45309; }
 
-::-webkit-scrollbar-track {
-  background: #fef3c7;
-}
+* { scroll-behavior: smooth; }
 
-::-webkit-scrollbar-thumb {
-  background: #d97706;
-  border-radius: 4px;
-}
-
-::-webkit-scrollbar-thumb:hover {
-  background: #b45309;
-}
-
-/* Smooth transitions */
-* {
-  scroll-behavior: smooth;
-}
-
-/* Textarea focus styles */
 textarea:focus,
-input:focus {
-  box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.2);
-}
+input:focus { box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.2); }

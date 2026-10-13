@@ -11,8 +11,12 @@ import {
 } from './lib/headings';
 import { FIXED_USER_ID, ensureSupabaseSession } from './lib/hardcodedAuth';
 import { readLocalSession, clearLocalSession, writeLocalSessionItem, readLocalSessionItem } from './lib/localSession';
-import { exportPagesToA4Pdf } from './lib/pdfExport';
-import { paginateBlocks, estimateTextHeightUnits, type PageBlock } from './lib/paginate';
+import { exportDiaryToA4Pdf, CONTENT_W_CSS } from './lib/pdfExport';
+import { resolveImageUrl, loadDataUrlCached } from './lib/images';
+import { LoveStoryHeader, LoveStoryFooter } from './lib/loveStory';
+
+/** CSS px per mm at 96dpi — the sheet is laid out in real millimetres. */
+const PX_PER_MM = 96 / 25.4;
 
 // Sticker: an image (from a link) placed anywhere on an A4 page.
 interface Sticker {
@@ -66,6 +70,7 @@ function App() {
   const [stickerRotate, setStickerRotate] = useState(-3); // degrees
   const [placingMode, setPlacingMode] = useState(false);
   const [exportingPdf, setExportingPdf] = useState(false);
+  const [pdfProgress, setPdfProgress] = useState<{ done: number; total: number } | null>(null);
   const [flipDir, setFlipDir] = useState<'next' | 'prev'>('next');
 
   // Check auth state on mount — hardcoded login gate (DeepNectar)
@@ -559,121 +564,153 @@ function App() {
   const completeDiaryGroups = buildCompleteDiary(filteredEntries);
   const diaryDateRange = dateRangeOf(entries.map((e) => e.dateTime));
 
-  // --- A4 pagination: turn the whole diary into fixed A4 pages ---
-  const charsPerLine = 82;   // approx chars per line at 10pt on a narrow-margin A4
-  const linesPerPageUnit = 56; // approx lines that fit in one full printable page height
+  // =====================================================================
+  // EXACT A4 PAGINATION — one flat stream of atomic blocks, measured from
+  // the live DOM at true print size. The SAME pages drive the on-screen
+  // sheet and the exported PDF, so nothing overflows and no page is left
+  // with big empty gaps.
+  // =====================================================================
+  const flowHostRef = useRef<HTMLDivElement>(null);
+  const [flowPages, setFlowPages] = useState<{ key: string; html: string; height: number }[][]>([]);
+  const [flowTick, setFlowTick] = useState(0);
 
-  const diaryPages: PageBlock[][] = (() => {
-    const blocks: PageBlock[] = [];
+  const esc = (s: string) =>
+    (s || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
 
-    // Cover page block (title + date range) — always first
-    blocks.push({
+  const buildBlocksHtml = (): { key: string; html: string }[] => {
+    const out: { key: string; html: string }[] = [];
+
+    // Cover block — always first on page 1 (fills the top area nicely)
+    out.push({
       key: 'cover',
-      heightUnits: 0.3,
-      render: () => (
-        <div style={{ textAlign: 'center', padding: '18mm 0 10mm' }}>
-          <div style={{ fontSize: '34pt', lineHeight: 1 }}>📖</div>
-          <h1 style={{ fontFamily: 'Georgia, serif', fontSize: '18pt', color: '#78350f', margin: '6mm 0 2mm' }}>
-            COMPLETE DIARY
-          </h1>
-          <h2 style={{ fontFamily: 'Georgia, serif', fontSize: '14pt', color: '#9a3412', margin: '0 0 4mm' }}>
-            DEEP &amp; 🫰🫶🏻Chota Don❣️❤️😘
-          </h2>
-          <div style={{ color: '#b45309', letterSpacing: '2px', fontSize: '9pt' }}>========================================</div>
-          <p style={{ marginTop: '4mm', fontSize: '11pt', color: '#78350f' }}>
-            <strong>Date:</strong> {diaryDateRange || 'Date not specified — arranged by context'}
-          </p>
-          <p style={{ fontSize: '9pt', color: '#a16207', marginTop: '2mm' }}>
-            Oldest → newest · grouped under headings · nothing added, nothing removed
-          </p>
-        </div>
-      ),
+      html: `
+        <div class="pg-cover">
+          <div class="pg-cover-emoji">📖💕</div>
+          <h1 class="pg-cover-title">OUR LOVE STORY — COMPLETE DIARY</h1>
+          <h2 class="pg-cover-sub">Deep &amp; Shinu (🫰🫶🏻 Chota Don ❣️❤️😘)</h2>
+          <div class="pg-cover-rule">============================================================</div>
+          <p class="pg-cover-date"><strong>Date:</strong> ${esc(diaryDateRange || 'Date not specified — arranged by context')}</p>
+          <p class="pg-cover-note">Oldest → newest · grouped under headings · nothing added, nothing removed</p>
+        </div>`,
     });
 
     for (const group of completeDiaryGroups) {
-      blocks.push({
-        key: `h-${group.heading}-${blocks.length}`,
-        heightUnits: 0.06,
-        render: () => (
-          <h2 className="pg-heading">
-            <span style={{
-              display: 'inline-flex', alignItems: 'center', justifyContent: 'center',
-              width: '6mm', height: '6mm', borderRadius: '9999px', background: '#d97706',
-              color: '#fff', fontSize: '9pt', marginRight: '2mm',
-            }}>{group.number}</span>
-            {group.heading}
-            <span style={{ fontSize: '8pt', color: '#b45309', marginLeft: '2mm' }}>({group.items.length})</span>
-          </h2>
-        ),
+      out.push({
+        key: `h-${group.number}-${out.length}`,
+        html: `<h2 class="pg-heading"><span class="pg-hnum">${group.number}</span>${esc(group.heading)}<span class="pg-hcount">(${group.items.length})</span></h2>`,
       });
-
       for (const entry of group.items) {
-        const msgH = estimateTextHeightUnits(`Message: ${entry.dateTime} - ${entry.senderName}: "${entry.message}"`, charsPerLine, linesPerPageUnit);
-        const feelH = estimateTextHeightUnits(`What I felt: ${entry.reflection}`, charsPerLine - 4, linesPerPageUnit * 1.1);
-        blocks.push({
+        out.push({
           key: `e-${entry.id}`,
-          heightUnits: msgH + feelH + 0.05,
-          render: () => (
-            <div className="pg-entry">
-              <div className="pg-meta">🕐 {entry.dateTime}</div>
-              <div className="pg-msg">
-                <strong style={{ color: '#b45309' }}>Message:</strong>{' '}
-                <strong>{entry.dateTime}</strong> - <strong style={{ color: '#b45309' }}>{entry.senderName}</strong>:{' '}
-                <em>"{entry.message}"</em>
-              </div>
-              <div className="pg-feel">
-                <strong style={{ fontStyle: 'normal', color: '#c2410c' }}>💭 What I felt:</strong> {entry.reflection}
-              </div>
-            </div>
-          ),
+          html: `
+            <div class="pg-entry">
+              <div class="pg-meta">🕐 ${esc(entry.dateTime)}</div>
+              <div class="pg-msg"><strong class="pg-sender-label">Message:</strong> <strong>${esc(entry.dateTime)}</strong> - <strong class="pg-sender">${esc(entry.senderName)}</strong>: <em>"${esc(entry.message)}"</em></div>
+              <div class="pg-feel"><strong class="pg-feel-label">💭 What I felt:</strong> ${esc(entry.reflection)}</div>
+            </div>`,
         });
       }
     }
 
-    // Final summary block(s)
     if (filteredEntries.length > 0 && !searchQuery) {
       const summaryLines = buildSummaryLines(entries);
-      blocks.push({
-        key: 'summary-title',
-        heightUnits: 0.07,
-        render: () => (
-          <h2 className="pg-heading" style={{ textAlign: 'center', borderBottom: '2px solid #f59e0b' }}>
-            📌 FINAL SUMMARY — COMPLETE DIARY
-          </h2>
-        ),
+      out.push({ key: 'summary-title', html: `<h2 class="pg-heading pg-summary-title">📌 FINAL SUMMARY — COMPLETE DIARY</h2>` });
+      out.push({
+        key: 'summary-list',
+        html: `<ul class="pg-summary-list">${summaryLines.map((l) => `<li><span class="pg-bullet">•</span> ${esc(l)}</li>`).join('')}</ul>`,
       });
-      // Split summary into two halves so it can flow across pages naturally
-      const half = Math.ceil(summaryLines.length / 2);
-      const mkList = (lines: string[], k: string): PageBlock => ({
-        key: k,
-        heightUnits: lines.reduce((acc, l) => acc + estimateTextHeightUnits(l, charsPerLine - 4, linesPerPageUnit), 0) + 0.03,
-        render: () => (
-          <ul style={{ listStyle: 'none', padding: 0, margin: '2mm 4mm' }}>
-            {lines.map((l, i) => (
-              <li key={i} style={{ marginBottom: '2.2mm', fontSize: '10pt', color: '#713f12' }}>
-                <span style={{ color: '#f59e0b' }}>•</span> {l}
-              </li>
-            ))}
-          </ul>
-        ),
-      });
-      blocks.push(mkList(summaryLines.slice(0, half), 'sum-1'));
-      blocks.push(mkList(summaryLines.slice(half), 'sum-2'));
-      blocks.push({
-        key: 'sum-end',
-        heightUnits: 0.04,
-        render: () => (
-          <p style={{ textAlign: 'center', color: '#b45309', letterSpacing: '2px', fontSize: '8pt', fontWeight: 700 }}>
-            ========================================
-          </p>
-        ),
-      });
+      out.push({ key: 'sum-end', html: `<p class="pg-sum-end">========================================</p>` });
     }
 
-    return paginateBlocks(blocks);
-  })();
+    return out;
+  };
 
-  const totalPages = diaryPages.length;
+  // Measure every atomic block once, then pack them into exact A4 sheets.
+  useEffect(() => {
+    if (!user || entries.length === 0) {
+      setFlowPages([]);
+      return;
+    }
+    const host = flowHostRef.current;
+    if (!host) return;
+
+    const raf = requestAnimationFrame(() => {
+      const blocks = buildBlocksHtml();
+      host.innerHTML = blocks
+        .map((b) => `<div data-k="${b.key}" style="width:${CONTENT_W_CSS}px;box-sizing:border-box;">${b.html}</div>`)
+        .join('');
+
+      const measured = Array.from(host.children as HTMLCollectionOf<HTMLElement>).map((el, i) => ({
+        key: blocks[i].key,
+        html: blocks[i].html,
+        height: el.offsetHeight,
+      }));
+
+      // Available content height inside one A4 sheet:
+      //   sheet − narrow margins − header band − footer band − page-number reserve
+      const headerEl = document.getElementById('ls-header-measure');
+      const footerEl = document.getElementById('ls-footer-measure');
+      const headerH = headerEl ? headerEl.offsetHeight : Math.round(34 * PX_PER_MM);
+      const footerH = footerEl ? footerEl.offsetHeight : Math.round(22 * PX_PER_MM);
+      const MARGIN = Math.round(8 * PX_PER_MM);
+      const PAGE_H = Math.round(297 * PX_PER_MM);
+      const gap = Math.round(2 * PX_PER_MM);
+      const pageNumberReserve = Math.round(10 * PX_PER_MM);
+      const available = PAGE_H - MARGIN * 2 - (headerH + gap) - (footerH + gap) - pageNumberReserve;
+
+      const pages: { key: string; html: string; height: number }[][] = [];
+      let cur: { key: string; html: string; height: number }[] = [];
+      let used = 0;
+      for (const m of measured) {
+        const h = Math.min(m.height, Math.max(available, 100));
+        if (used + h > available && cur.length) {
+          pages.push(cur);
+          cur = [];
+          used = 0;
+        }
+        cur.push({ ...m, height: h });
+        used += h;
+      }
+      if (cur.length) pages.push(cur);
+      if (pages.length === 0) pages.push([]);
+      setFlowPages(pages);
+    });
+
+    return () => cancelAnimationFrame(raf);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [entries, searchQuery, flowTick, user]);
+
+  // Re-pack once the header/footer images finish loading (their height depends on aspect ratio)
+  useEffect(() => {
+    let cancelled = false;
+    const t = setTimeout(() => {
+      const imgs = [
+        ...(document.getElementById('ls-header-measure')?.querySelectorAll('img') ?? []),
+        ...(document.getElementById('ls-footer-measure')?.querySelectorAll('img') ?? []),
+      ] as HTMLImageElement[];
+      if (!imgs.length) return;
+      Promise.all(
+        imgs.map(
+          (img) =>
+            new Promise<void>((resolve) => {
+              if (img.complete && img.naturalWidth > 0) return resolve();
+              img.onload = () => resolve();
+              img.onerror = () => resolve();
+            })
+        )
+      ).then(() => {
+        if (!cancelled) setFlowTick((x) => x + 1);
+      });
+    }, 400);
+    return () => { cancelled = true; clearTimeout(t); };
+  }, []);
+
+  const totalPages = Math.max(flowPages.length, 1);
+
 
   // Keep current page in range when content shrinks
   useEffect(() => {
@@ -689,7 +726,6 @@ function App() {
   useEffect(() => {
     const el = sheetWrapRef.current;
     if (!el) return;
-    const PX_PER_MM = 96 / 25.4;
     const update = () => {
       const availW = el.clientWidth;                       // px
       const availH = window.innerHeight - 230;             // px: header + controls/footer space
@@ -723,8 +759,9 @@ function App() {
 
   // --- Stickers ---
   const addStickerAt = (xPct: number, yPct: number) => {
-    const url = stickerUrl.trim();
-    if (!url) return;
+    const raw = stickerUrl.trim();
+    if (!raw) return;
+    const url = resolveImageUrl(raw); // Google Drive share links → embeddable image URLs
     const s: Sticker = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
       url,
@@ -751,17 +788,31 @@ function App() {
       )
     );
 
-  // --- Save as PDF (A4, all pages, with page numbers + stickers) ---
   const handleSaveAsPdf = async () => {
+    if (exportingPdf) return;
     setExportingPdf(true);
     setShowMenu(false);
+    setPdfProgress(null);
     try {
-      const n = await exportPagesToA4Pdf('.a4-print-area .a4-page', `my-diary-${new Date().toISOString().split('T')[0]}.pdf`);
-      setImportStatus({ type: 'success', message: `Saved PDF with ${n} A4 page${n === 1 ? '' : 's'}!` });
+      // Warm the image cache so the exporter never stalls on the network.
+      await Promise.allSettled(stickers.map((s) => loadDataUrlCached(s.url)));
+
+      const n = await exportDiaryToA4Pdf({
+        blocksSelector: '#pdf-blocks',
+        bands: [
+          { nodeId: 'ls-header-print', position: 'top' },
+          { nodeId: 'ls-footer-print', position: 'bottom' },
+        ],
+        fileName: `our-love-story-${new Date().toISOString().split('T')[0]}.pdf`,
+        onPageProgress: (done, total) => setPdfProgress({ done, total }),
+      });
+      setImportStatus({ type: 'success', message: `Saved PDF with ${n} A4 page${n === 1 ? '' : 's'}! 💕` });
     } catch (err: any) {
+      console.error(err);
       setImportStatus({ type: 'error', message: err?.message || 'Failed to export PDF.' });
     } finally {
       setExportingPdf(false);
+      setPdfProgress(null);
     }
   };
 
@@ -1273,7 +1324,17 @@ function App() {
                     ['--flip-from' as any]: flipDir === 'next' ? '45%' : '-45%',
                   }}
                 >
-                  <div className="a4-print-area">{diaryPages[currentPage].map((b) => <div key={b.key}>{b.render()}</div>)}</div>
+                  {/* Header band on EVERY page — photo in the left corner + titles */}
+                  <LoveStoryHeader />
+
+                  <div className="a4-print-area">
+                    {(flowPages[currentPage] ?? []).map((b) => (
+                      <div key={b.key} dangerouslySetInnerHTML={{ __html: b.html }} />
+                    ))}
+                  </div>
+
+                  {/* Footer band on EVERY page — both signatures */}
+                  <LoveStoryFooter />
 
                   {/* Stickers pinned to this page */}
                   {stickersForCurrentPage.map((s) => (
@@ -1344,26 +1405,52 @@ function App() {
         )}
       </main>
 
-      {/* Hidden full-size A4 pages used ONLY for PDF export (all pages, stickers, page numbers) */}
+      {/* ============================================================
+          OFF-SCREEN PRINT DOM — the ONLY source for the PDF export.
+          Same blocks the site paginates, laid out at true A4 content
+          width with the header & signature bands. Hidden visually,
+          present in the DOM so the exporter can measure & rasterize.
+         ============================================================ */}
       {entries.length > 0 && (
-        <div style={{ position: 'absolute', left: -99999, top: 0, width: '210mm' }} aria-hidden="true">
-          {diaryPages.map((pageBlocks, idx) => (
-            <div key={`print-${idx}`} className="a4-page" style={{ transform: 'none' }}>
-              <div className="a4-print-area">
-                {pageBlocks.map((b) => <div key={b.key}>{b.render()}</div>)}
+        <div style={{ position: 'absolute', left: -99999, top: 0, width: `${CONTENT_W_CSS}px` }} aria-hidden="true">
+          {/* measurement copies of the bands (their height feeds the paginator) */}
+          <div id="ls-header-measure" style={{ width: `${CONTENT_W_CSS}px` }}>
+            <LoveStoryHeader />
+          </div>
+          <div id="ls-footer-measure" style={{ width: `${CONTENT_W_CSS}px` }}>
+            <LoveStoryFooter />
+          </div>
+
+          {/* exact bands stamped by the PDF exporter onto every A4 sheet */}
+          <div id="ls-header-print" style={{ width: `${CONTENT_W_CSS}px`, background: '#ffffff' }}>
+            <LoveStoryHeader />
+          </div>
+          <div id="ls-footer-print" style={{ width: `${CONTENT_W_CSS}px`, background: '#ffffff' }}>
+            <LoveStoryFooter />
+          </div>
+
+          {/* flattened content blocks — packed into A4 sheets by the exporter,
+              then each page's stickers appended right after its blocks */}
+          <div id="pdf-blocks" style={{ width: `${CONTENT_W_CSS}px`, fontSize: '10pt', lineHeight: 1.45, color: '#3f2a12' }}>
+            {flowPages.map((pageBlocks, pi) => (
+              <div key={`pp-${pi}`} data-page={pi}>
+                {pageBlocks.map((b) => (
+                  <div key={`p-${b.key}`} dangerouslySetInnerHTML={{ __html: b.html }} />
+                ))}
+                {stickers.filter((s) => s.page === pi).map((s) => (
+                  <div
+                    key={`p-sticker-${s.id}`}
+                    style={{ width: `${(s.sizePct / 100) * CONTENT_W_CSS}px`, margin: '4px auto', transform: `rotate(${s.rotate}deg)` }}
+                  >
+                    <img src={s.url} alt="sticker" draggable={false} style={{ width: '100%', display: 'block', border: '3px solid #fff', borderRadius: '8px' }} />
+                  </div>
+                ))}
               </div>
-              {stickers.filter((s) => s.page === idx).map((s) => (
-                <div
-                  key={`print-sticker-${s.id}`}
-                  className="diary-sticker"
-                  style={{ left: `${s.xPct}%`, top: `${s.yPct}%`, width: `${s.sizePct}%`, transform: `rotate(${s.rotate}deg)` }}
-                >
-                  <img src={s.url} alt="sticker" crossOrigin="anonymous" draggable={false} />
-                </div>
-              ))}
-              <div className="a4-page-number">Page {idx + 1} of {totalPages}</div>
-            </div>
-          ))}
+            ))}
+          </div>
+
+          {/* live measurement host for the paginator */}
+          <div ref={flowHostRef} style={{ width: `${CONTENT_W_CSS}px`, fontSize: '10pt', lineHeight: 1.45, color: '#3f2a12' }} />
         </div>
       )}
 

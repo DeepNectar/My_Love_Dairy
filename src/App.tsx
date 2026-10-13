@@ -11,12 +11,24 @@ import {
 } from './lib/headings';
 import { FIXED_USER_ID, ensureSupabaseSession } from './lib/hardcodedAuth';
 import { readLocalSession, clearLocalSession, writeLocalSessionItem, readLocalSessionItem } from './lib/localSession';
-import { exportDiaryToA4Pdf, CONTENT_W_CSS } from './lib/pdfExport';
+import { exportDiaryToA4Pdf, CONTENT_W_CSS, CSS_PX_PER_MM, computeAvailableFlowHeightCss } from './lib/pdfExport';
 import { resolveImageUrl, loadDataUrlCached, RobustImg } from './lib/images';
 import { LoveStoryHeader, LoveStoryFooter } from './lib/loveStory';
 
 /** CSS px per mm at 96dpi — the sheet is laid out in real millimetres. */
-const PX_PER_MM = 96 / 25.4;
+const PX_PER_MM = CSS_PX_PER_MM;
+
+/**
+ * Snapshot helper: deep-clone a node and strip everything that only exists
+ * for on-screen interaction (hover "✕" / nudge buttons on stickers). The PDF
+ * exporter rasterizes these clones, so the printed page shows exactly the
+ * visual preview — photos, titles, text, signatures — without UI chrome.
+ */
+function printClone(node: HTMLElement): HTMLElement {
+  const c = node.cloneNode(true) as HTMLElement;
+  c.querySelectorAll('button').forEach((b) => b.remove());
+  return c;
+}
 
 // Sticker: an image (from a link) placed anywhere on an A4 page.
 interface Sticker {
@@ -701,12 +713,9 @@ function App() {
       );
       const headerH = headerEl ? Math.max(headerEl.offsetHeight, headerEl.scrollHeight) : Math.round(34 * PX_PER_MM);
       const footerH = footerEl ? Math.max(footerEl.offsetHeight, footerEl.scrollHeight) : Math.round(22 * PX_PER_MM);
-      const MARGIN = Math.round(8 * PX_PER_MM);
-      const PAGE_H = Math.round(297 * PX_PER_MM);
-      const gap = Math.round(2 * PX_PER_MM);
-      const pageNumberReserve = Math.round(10 * PX_PER_MM);
-      // tiny safety margin so rounding never pushes a line past the sheet edge
-      const available = PAGE_H - MARGIN * 2 - (headerH + gap) - (footerH + gap) - pageNumberReserve - 6;
+      // Identical formula to the PDF exporter — preview pages and PDF sheets
+      // MUST break at exactly the same blocks.
+      const available = computeAvailableFlowHeightCss(headerH, footerH);
 
       type FlowBlock = { key: string; html: string; height: number; sliceTop?: number };
       const pages: FlowBlock[][] = [];
@@ -886,6 +895,9 @@ function App() {
           { nodeId: 'ls-header-print', position: 'top' },
           { nodeId: 'ls-footer-print', position: 'bottom' },
         ],
+        // Rasterize clean clones (no hover/nudge buttons) so the PDF shows
+        // exactly the visual preview of each page.
+        prepareNode: printClone,
         fileName: `our-love-story-${new Date().toISOString().split('T')[0]}.pdf`,
         onPageProgress: (done, total) => setPdfProgress({ done, total }),
       });

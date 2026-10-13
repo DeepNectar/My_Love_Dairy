@@ -129,11 +129,27 @@ export function resolveStickerPlacements(
   return Array.from({ length: T }, (_, p) => mk(p, seededRandomFrom(`${s.id}:${p}`)));
 }
 
+/**
+ * A fully pre-rendered sheet. When supplied, the exporter drops that exact
+ * bitmap onto its A4 page — this is how the PDF becomes literally "the same
+ * page that is there in the HTML site preview": the browser itself paints the
+ * complete sheet (header band on top, all entries, footer band at the bottom,
+ * page number, stickers), and the exporter only assembles the sheets.
+ */
+export interface PreRenderedPage {
+  canvas: HTMLCanvasElement;
+}
+
 export interface PdfOptions {
   blocksSelector: string;
   bands?: PdfBand[];
   /** Stickers scattered onto the sheets (unresolved Drive links are loaded automatically). */
   stickers?: PdfSticker[];
+  /**
+   * Optional ready-made sheets produced by `renderSheetNode` (one per visible
+   * preview page). Takes precedence over the block-flow pipeline when given.
+   */
+  pages?: PreRenderedPage[];
   fileName: string;
   onPageProgress?: (done: number, total: number) => void;
   /**
@@ -412,21 +428,6 @@ async function rasterizeNode(
   return { canvas, heightCss };
 }
 
-/** Wait until every <img> inside `root` has settled (loaded or failed). */
-async function waitForImages(root: HTMLElement) {
-  const imgs = Array.from(root.querySelectorAll('img'));
-  await Promise.all(
-    imgs.map(
-      (img) =>
-        new Promise<void>((resolve) => {
-          if (img.complete && img.naturalWidth > 0) return resolve();
-          img.onload = () => resolve();
-          img.onerror = () => resolve();
-        })
-    )
-  );
-}
-
 /** Rasterize a single content block straight from the live DOM node. */
 async function rasterizeBlock(
   b: MeasuredBlock,
@@ -516,7 +517,111 @@ function roundRectPath(ctx: CanvasRenderingContext2D, x: number, y: number, w: n
   ctx.closePath();
 }
 
+/** Wait until every <img> inside `root` has settled (loaded or failed). */
+async function waitForImages(root: HTMLElement) {
+  const imgs = Array.from(root.querySelectorAll('img'));
+  await Promise.all(
+    imgs.map(
+      (img) =>
+        new Promise<void>((resolve) => {
+          if (img.complete && img.naturalWidth > 0) return resolve();
+          img.onload = () => resolve();
+          img.onerror = () => resolve();
+        })
+    )
+  );
+}
+
+// ---------------------------------------------------------------------------
+// WHOLE-SHEET RENDERER ("what you see is what you print")
+// ---------------------------------------------------------------------------
+
+const SHEET_PX_W = Math.round(210 * CSS_PX_PER_MM); // 210mm laid out at true CSS size
+const SHEET_PX_H = Math.round(297 * CSS_PX_PER_MM); // 297mm
+
+/**
+ * Rasterize a complete A4 preview node (`.a4-page`: header band on top, all
+ * entries in the middle, signature footer at the bottom, page number, pinned
+ * stickers) into an exact ~300 DPI sheet bitmap. The node is temporarily
+ * returned to its TRUE printed size (the on-screen sheet is shrunk with a CSS
+ * scale transform), swapped to fully inlined/CORS-clean markup so the browser's
+ * own SVG engine paints it identically to the site preview, then restored.
+ */
+export async function renderSheetNode(
+  node: HTMLElement,
+  opts?: { prepare?: (n: HTMLElement) => HTMLElement },
+): Promise<HTMLCanvasElement> {
+  // Inline remote images (Drive links) as data URLs BEFORE snapshotting —
+  // an SVG foreignObject can never load external resources itself.
+  await inlineImages(node);
+  await waitForImages(node);
+
+  const prevTransform = node.style.transform;
+  const prevAnimation = node.style.animation;
+  node.style.transform = 'none';
+  node.style.animation = 'none';
+
+  try {
+    const rawClone = opts?.prepare ? opts.prepare(node) : (node.cloneNode(true) as HTMLElement);
+    const clone = rawClone;
+    clone.style.width = `${SHEET_PX_W}px`;
+    clone.style.height = `${SHEET_PX_H}px`;
+    clone.style.boxSizing = 'border-box';
+    clone.style.position = 'relative';
+    clone.style.left = '0';
+    clone.style.top = '0';
+    clone.style.transform = 'none';
+    clone.style.animation = 'none';
+    clone.style.margin = '0';
+
+    const inner = inlineComputedStyles(clone);
+    const svg =
+      `<svg xmlns="http://www.w3.org/2000/svg" width="${SHEET_PX_W}" height="${SHEET_PX_H}" viewBox="0 0 ${SHEET_PX_W} ${SHEET_PX_H}">` +
+      `<foreignObject width="${SHEET_PX_W}" height="${SHEET_PX_H}">` +
+      `<div xmlns="http://www.w3.org/1999/xhtml">${inner}</div>` +
+      `</foreignObject></svg>`;
+
+    const url = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(svg);
+    const img = new Image();
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error('Sheet snapshot failed to decode.'));
+      img.src = url;
+    });
+
+    const canvas = document.createElement('canvas');
+    canvas.width = CANVAS_W;
+    canvas.height = CANVAS_H;
+    const ctx = canvas.getContext('2d')!;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    return canvas;
+  } finally {
+    node.style.transform = prevTransform;
+    node.style.animation = prevAnimation;
+  }
+}
+
 export async function exportDiaryToA4Pdf(opts: PdfOptions): Promise<number> {
+  // ================= FAST PATH: pre-rendered whole sheets =================
+  // The app rasterizes EVERY visible preview page (complete with header,
+  // footer, all entries, page numbers and scattered stickers) and hands the
+  // finished bitmaps over here. The PDF is then literally the same pages the
+  // user sees on the site — nothing else can shift, clip or go missing.
+  if (opts.pages && opts.pages.length > 0) {
+    const pdf = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4', compress: true });
+    for (let i = 0; i < opts.pages.length; i++) {
+      if (i > 0) pdf.addPage();
+      pdf.addImage(opts.pages[i].canvas.toDataURL('image/jpeg', 0.92), 'JPEG', 0, 0, A4_MM.width, A4_MM.height, undefined, 'FAST');
+      opts.onPageProgress?.(i + 1, opts.pages.length);
+      await nextFrame();
+    }
+    pdf.save(opts.fileName);
+    return opts.pages.length;
+  }
+
+  // ============ FALLBACK PATH: flow blocks + stamp bands ourselves =========
   const container = document.querySelector<HTMLElement>(opts.blocksSelector);
   if (!container) throw new Error('Nothing to export yet — add some entries first.');
 

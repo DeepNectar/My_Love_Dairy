@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { supabase, DiaryEntry as SupabaseEntry } from './lib/supabase';
 import Auth from './components/Auth';
 import { HEADING_CATEGORIES, defaultHeading, buildHeadingText, parseTemplateEntries } from './lib/headings';
-import { FIXED_USER_ID, getFixedSupabaseUserId } from './lib/hardcodedAuth';
+import { FIXED_USER_ID, ensureSupabaseSession } from './lib/hardcodedAuth';
 import { readLocalSession, clearLocalSession } from './lib/localSession';
 
 interface DiaryEntry {
@@ -40,7 +40,8 @@ function App() {
         const session = await readLocalSession();
         if (!mounted) return;
         if (session) {
-          const uid = await getFixedSupabaseUserId();
+          // Establish a real Supabase session so RLS policies accept our writes.
+          const uid = await ensureSupabaseSession();
           if (!mounted) return;
           setUser({ id: uid, email: FIXED_USER_ID, name: FIXED_USER_ID });
           setSenderName(FIXED_USER_ID);
@@ -62,12 +63,18 @@ function App() {
 
   const handleAuthSuccess = async () => {
     try {
-      const uid = await getFixedSupabaseUserId();
+      // Real Supabase login behind the scenes → RLS policies will pass.
+      const uid = await ensureSupabaseSession();
       setUser({ id: uid, email: FIXED_USER_ID, name: FIXED_USER_ID });
       setSenderName(FIXED_USER_ID);
       fetchEntries(uid);
     } catch (err) {
       console.error('Post-login setup failed:', err);
+      clearLocalSession();
+      setImportStatus({
+        type: 'error',
+        message: 'Logged in, but cloud sync failed. Check Supabase account setup.',
+      });
     }
   };
 
@@ -138,6 +145,8 @@ function App() {
     }
     setUser(null);
     setEntries([]);
+    // Also reset the cached uid so a stale value isn't reused after logout.
+    await import('./lib/hardcodedAuth').then((m) => m.resetCachedUserId());
   };
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -161,7 +170,7 @@ function App() {
         .eq('id', editingId);
 
       if (error) {
-        setImportStatus({ type: 'error', message: 'Failed to update entry' });
+        setImportStatus({ type: 'error', message: `Failed to update entry: ${error.message}` });
       } else {
         setImportStatus({ type: 'success', message: 'Entry updated successfully!' });
         fetchEntries();
@@ -173,7 +182,7 @@ function App() {
         .insert([entryData]);
 
       if (error) {
-        setImportStatus({ type: 'error', message: 'Failed to save entry' });
+        setImportStatus({ type: 'error', message: `Failed to save entry: ${error.message}` });
       } else {
         setImportStatus({ type: 'success', message: 'Entry saved successfully!' });
         fetchEntries();

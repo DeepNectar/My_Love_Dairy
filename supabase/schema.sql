@@ -86,7 +86,8 @@ CREATE POLICY "Users can insert own entries"
 DROP POLICY IF EXISTS "Users can update own entries" ON diary_entries;
 CREATE POLICY "Users can update own entries"
   ON diary_entries FOR UPDATE
-  USING (auth.uid() = user_id);
+  USING (auth.uid() = user_id)
+  WITH CHECK (auth.uid() = user_id);
 
 DROP POLICY IF EXISTS "Users can delete own entries" ON diary_entries;
 CREATE POLICY "Users can delete own entries"
@@ -109,3 +110,47 @@ CREATE TRIGGER update_diary_entries_updated_at
   EXECUTE FUNCTION update_updated_at_column();
 
 -- Done ✅ — the app's dropdown/export/import templates use exactly these 15 headings.
+
+-- ============================================================
+-- 6) REQUIRED: Create the fixed login account in Supabase Auth
+-- ------------------------------------------------------------
+-- The app logs in to Supabase behind the scenes with this exact
+-- email + password so every request carries a real JWT and passes
+-- the RLS policies above. Without this step you will get:
+--   "new row violates row-level security policy for table diary_entries"
+--
+-- Option A (recommended): Supabase Dashboard → Authentication → Users →
+--   "Add user" → Email: deepnectar@diary-app.local, Password: DeepuH@2805
+--   (disable "Email signups" confirmation if prompted / auto-confirm).
+--
+-- Option B: run this SQL block (creates the auth user directly):
+-- ------------------------------------------------------------
+-- DO $$
+-- DECLARE v_uid uuid := gen_random_uuid();
+-- BEGIN
+--   IF NOT EXISTS (SELECT 1 FROM auth.users WHERE email = 'deepnectar@diary-app.local') THEN
+--     INSERT INTO auth.users (
+--       instance_id, id, aud, role, email, encrypted_password,
+--       email_confirmed_at, recovery_sent_at, last_sign_in_at,
+--       raw_app_meta_data, raw_user_meta_data, created_at, updated_at,
+--       confirmation_token, email_change, email_change_token_new,
+--       phone_change, phone_change_token, reauthentication_token
+--     ) VALUES (
+--       '00000000-0000-0000-0000-000000000000', v_uid, 'authenticated', 'authenticated',
+--       'deepnectar@diary-app.local',
+--       crypt('DeepuH@2805', gen_salt('bf')),
+--       NOW(), NULL, NULL,
+--       '{"provider":"email","providers":["email"]}',
+--       '{}', NOW(), NOW(), '', '', '', '', '', ''
+--     );
+--     INSERT INTO auth.identities (id, user_id, provider_id, identity_data, provider, last_sign_in_at, created_at, updated_at)
+--     VALUES (gen_random_uuid(), v_uid, v_uid::text,
+--             jsonb_build_object('sub', v_uid::text, 'email', 'deepnectar@diary-app.local', 'email_verified', true),
+--             'email', NOW(), NOW(), NOW());
+--   END IF;
+-- END $$;
+--
+-- If you use a different email/password, set them in .env:
+--   VITE_DIARY_ACCOUNT_EMAIL=...
+--   VITE_DIARY_ACCOUNT_PASSWORD=...
+-- ============================================================

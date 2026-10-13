@@ -29,14 +29,19 @@ export function driveIdFromLink(link: string): string | null {
   return null;
 }
 
-/** Turn any Google Drive share/view link into a direct, embeddable image URL. */
+/** Turn any Google Drive share/view link into a direct, embeddable image URL.
+ *  NOTE: `drive.google.com/thumbnail` is NOT CORS-enabled in the browser and
+ *  fails when an <img> carries crossOrigin="anonymous" (and under fetch with
+ *  mode:'cors'), which broke every preview. lh3.googleusercontent.com serves
+ *  the same image WITH `Access-Control-Allow-Origin: *`, so we use it here. */
 export function resolveImageUrl(link: string, width = 1400): string {
   const id = driveIdFromLink(link);
-  if (id) return `https://drive.google.com/thumbnail?id=${id}&sz=w${width}`;
+  if (id) return `https://lh3.googleusercontent.com/d/${id}=w${width}`;
   return (link || '').trim();
 }
 
-/** Every URL variant that can serve a given Drive file (thumbnail → lh3 → download → proxies). */
+/** Every URL variant that can serve a given Drive file (CORS-safe first, so
+ *  previews render immediately even with crossOrigin set; then fallbacks). */
 export function candidateUrlsForLink(link: string, width = 1400): string[] {
   const s = (link || '').trim();
   const id = driveIdFromLink(s);
@@ -44,11 +49,11 @@ export function candidateUrlsForLink(link: string, width = 1400): string[] {
     // Not a Drive link — original + proxied versions.
     return Array.from(new Set([s, ...PROXIES.map((p) => p(s))]));
   }
-  const thumb = `https://drive.google.com/thumbnail?id=${id}&sz=w${width}`;
   const lh3 = `https://lh3.googleusercontent.com/d/${id}=w${width}`;
+  const thumb = `https://drive.google.com/thumbnail?id=${id}&sz=w${width}`;
   const uc = `https://drive.usercontent.google.com/download?id=${id}&export=view`;
   const ucFull = `https://drive.usercontent.google.com/download?id=${id}&export=view&authuser=0`;
-  const originals = [thumb, lh3, uc, ucFull];
+  const originals = [lh3, thumb, uc, ucFull];
   const viaProxy = originals.flatMap((u) => PROXIES.map((p) => p(u)));
   return Array.from(new Set([...originals, ...viaProxy]));
 }

@@ -3,7 +3,9 @@ import { FIXED_USER_ID, verifyHardcodedPassword } from '../lib/hardcodedAuth';
 import { createLocalSession } from '../lib/localSession';
 
 interface AuthProps {
-  onAuthSuccess: () => void;
+  // Resolves once the hidden Supabase session is ready; rejects with a
+  // human-readable message if cloud sync can't connect.
+  onAuthSuccess: () => Promise<void> | void;
 }
 
 export default function Auth({ onAuthSuccess }: AuthProps) {
@@ -27,15 +29,17 @@ export default function Auth({ onAuthSuccess }: AuthProps) {
 
     setLoading(true);
     try {
-      // Small delay purely for UX so the button state is visible.
-      await new Promise((r) => setTimeout(r, 400));
+      // Tiny delay purely for UX so the button state is visible.
+      await new Promise((r) => setTimeout(r, 150));
       if (!verifyHardcodedPassword(password)) {
         setError('Incorrect password. Please try again.');
         setLoading(false);
         return;
       }
       await createLocalSession();
-      onAuthSuccess();
+      // Wait for the hidden Supabase session so we can surface real errors
+      // instead of leaving the user stuck on a spinner forever.
+      await onAuthSuccess();
     } catch (err: any) {
       setError(err?.message || 'Login failed');
       setLoading(false);

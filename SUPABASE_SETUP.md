@@ -250,3 +250,40 @@ MIT License - feel free to use this project for personal or commercial purposes.
 ## 🙏 Credits
 
 Built with React, Vite, Tailwind CSS, and Supabase.
+
+## ⚠️ IMPORTANT: Create the fixed login account in Supabase Auth (one-time)
+
+The app signs in to Supabase behind the scenes with a hidden email/password so
+every write carries a real JWT and passes the `diary_entries` RLS policies.
+**If this account does not exist, login fails and imports throw:**
+
+```
+new row violates row-level security policy for table "diary_entries"
+```
+
+Do ONE of these:
+
+### Option A — Dashboard (easiest)
+1. Supabase Dashboard → **Authentication → Users → Add user**
+   - Email: `deepnectar@diary-app.local`
+   - Password: `DeepuH@2805`
+   - ✅ Check **Auto Confirm User**
+2. **Authentication → Sign In / Up → Email**: turn **OFF** "Confirm email".
+
+### Option B — SQL Editor
+Open `supabase/schema.sql`, copy section **6)** (the `DO $$ ... END $$;` block)
+into the SQL Editor and run it. It creates the auth user directly.
+
+### Option C — CLI script
+```bash
+SUPABASE_SERVICE_ROLE_KEY=ey... npm run create-auth-user
+```
+(The service_role key is under Dashboard → Project Settings → API. Keep it secret.)
+
+Verify anytime with:
+```bash
+npm run create-auth-user   # without a key it just checks whether login works
+```
+
+If you use a different email/password, set `VITE_DIARY_ACCOUNT_EMAIL` and
+`VITE_DIARY_ACCOUNT_PASSWORD` in `.env` and update the dashboard user to match.

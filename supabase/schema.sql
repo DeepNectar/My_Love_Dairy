@@ -121,34 +121,37 @@ CREATE TRIGGER update_diary_entries_updated_at
 --
 -- Option A (recommended): Supabase Dashboard → Authentication → Users →
 --   "Add user" → Email: deepnectar@diary-app.local, Password: DeepuH@2805
---   (disable "Email signups" confirmation if prompted / auto-confirm).
+--   Check "Auto Confirm User". Also turn OFF email confirmation under
+--   Authentication → Sign In / Up → Email ("Confirm email"), otherwise
+--   password login is rejected until the (undeliverable) confirmation link
+--   is clicked.
 --
--- Option B: run this SQL block (creates the auth user directly):
+-- Option B: run this SQL block as-is in the SQL Editor (creates the auth user):
 -- ------------------------------------------------------------
--- DO $$
--- DECLARE v_uid uuid := gen_random_uuid();
--- BEGIN
---   IF NOT EXISTS (SELECT 1 FROM auth.users WHERE email = 'deepnectar@diary-app.local') THEN
---     INSERT INTO auth.users (
---       instance_id, id, aud, role, email, encrypted_password,
---       email_confirmed_at, recovery_sent_at, last_sign_in_at,
---       raw_app_meta_data, raw_user_meta_data, created_at, updated_at,
---       confirmation_token, email_change, email_change_token_new,
---       phone_change, phone_change_token, reauthentication_token
---     ) VALUES (
---       '00000000-0000-0000-0000-000000000000', v_uid, 'authenticated', 'authenticated',
---       'deepnectar@diary-app.local',
---       crypt('DeepuH@2805', gen_salt('bf')),
---       NOW(), NULL, NULL,
---       '{"provider":"email","providers":["email"]}',
---       '{}', NOW(), NOW(), '', '', '', '', '', ''
---     );
---     INSERT INTO auth.identities (id, user_id, provider_id, identity_data, provider, last_sign_in_at, created_at, updated_at)
---     VALUES (gen_random_uuid(), v_uid, v_uid::text,
---             jsonb_build_object('sub', v_uid::text, 'email', 'deepnectar@diary-app.local', 'email_verified', true),
---             'email', NOW(), NOW(), NOW());
---   END IF;
--- END $$;
+DO $$
+DECLARE v_uid uuid := gen_random_uuid();
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM auth.users WHERE email = 'deepnectar@diary-app.local') THEN
+    INSERT INTO auth.users (
+      instance_id, id, aud, role, email, encrypted_password,
+      email_confirmed_at, recovery_sent_at, last_sign_in_at,
+      raw_app_meta_data, raw_user_meta_data, created_at, updated_at,
+      confirmation_token, email_change, email_change_token_new,
+      phone_change, phone_change_token, reauthentication_token
+    ) VALUES (
+      '00000000-0000-0000-0000-000000000000', v_uid, 'authenticated', 'authenticated',
+      'deepnectar@diary-app.local',
+      crypt('DeepuH@2805', gen_salt('bf')),
+      NOW(), NULL, NULL,
+      '{"provider":"email","providers":["email"]}',
+      '{}', NOW(), NOW(), '', '', '', '', '', ''
+    );
+    INSERT INTO auth.identities (id, user_id, provider_id, identity_data, provider, last_sign_in_at, created_at, updated_at)
+    VALUES (gen_random_uuid(), v_uid, v_uid::text,
+            jsonb_build_object('sub', v_uid::text, 'email', 'deepnectar@diary-app.local', 'email_verified', true),
+            'email', NOW(), NOW(), NOW());
+  END IF;
+END $$;
 --
 -- If you use a different email/password, set them in .env:
 --   VITE_DIARY_ACCOUNT_EMAIL=...

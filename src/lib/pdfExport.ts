@@ -94,25 +94,29 @@ function measureBlocks(container: HTMLElement): MeasuredBlock[] {
   return out;
 }
 
-/** Break an oversized block into page-sized chunks using its direct children. */
-function splitOversized(block: MeasuredBlock, maxH: number): MeasuredBlock[][] {
-  const kids = Array.from(block.el.children) as HTMLElement[];
-  if (kids.length <= 1) return [[block]];
-  const chunks: MeasuredBlock[][] = [];
-  let current: MeasuredBlock[] = [];
-  let h = 0;
-  for (const kid of kids) {
-    const kh = kid.offsetHeight || kid.scrollHeight;
-    if (h + kh > maxH && current.length > 0) {
-      chunks.push(current);
-      current = [];
-      h = 0;
-    }
-    current.push({ el: kid, height: kh });
-    h += kh;
+/**
+ * Split an oversized block into page-sized slices by cloning it and revealing
+ * only the vertical slice that fits each sheet (offset-top cropping). Works
+ * even for blocks with no splittable children — nothing is ever clipped away.
+ */
+function sliceOversized(block: MeasuredBlock, maxH: number): MeasuredBlock[] {
+  const out: MeasuredBlock[] = [];
+  let offset = 0;
+  while (offset < block.height) {
+    const sliceH = Math.min(maxH, block.height - offset);
+    const clone = block.el.cloneNode(true) as HTMLElement;
+    clone.style.position = 'relative';
+    clone.style.top = `-${offset}px`;
+    // wrapper clips to exactly one printable slice of the block
+    const wrapper = document.createElement('div');
+    wrapper.style.width = `${CONTENT_W_CSS}px`;
+    wrapper.style.height = `${sliceH}px`;
+    wrapper.style.overflow = 'hidden';
+    wrapper.appendChild(clone);
+    out.push({ el: wrapper, height: sliceH });
+    offset += sliceH;
   }
-  if (current.length) chunks.push(current);
-  return chunks;
+  return out.length ? out : [block];
 }
 
 /** Re-flow measured blocks into A4 sheets — greedy fill, nothing dropped. */
@@ -129,11 +133,10 @@ export function flowIntoPages(blocks: MeasuredBlock[], availableHeightCss: numbe
   for (const b of blocks) {
     if (b.height > maxH) {
       pushPage();
-      for (const part of splitOversized(b, maxH)) {
-        const ph = part.reduce((a, x) => a + x.height, 0);
-        if (used + ph > maxH) pushPage();
-        current.push(...part);
-        used += ph;
+      for (const part of sliceOversized(b, maxH)) {
+        current.push(part);
+        used += part.height;
+        if (used >= maxH) pushPage();
       }
       continue;
     }
@@ -256,6 +259,9 @@ export async function exportDiaryToA4Pdf(opts: PdfOptions): Promise<number> {
     const node = document.getElementById(band.nodeId);
     if (node) await inlineImages(node);
   }
+  // Wait for web fonts to finish loading — text measured mid font-swap has
+  // the wrong height, which makes pages overflow in the exported PDF.
+  try { await (document as any).fonts?.ready; } catch { /* ignore */ }
   await nextFrame();
 
   // --- Bands (header/footer) rendered once, reused on every sheet ---
@@ -277,14 +283,26 @@ export async function exportDiaryToA4Pdf(opts: PdfOptions): Promise<number> {
 
   // The site already packs the SAME atomic blocks into these pages; honour
   // that pagination so the PDF matches what the user flipped through on-screen.
+  // If an on-screen page still measures taller than one sheet (late-loading
+  // images, fonts), its overflow is sliced onto extra sheets — never hidden.
   const pageNodes = Array.from(container.querySelectorAll<HTMLElement>('[data-page]'));
   let pages: MeasuredBlock[][];
   if (pageNodes.length > 0) {
     pages = [];
     for (const pn of pageNodes) {
       const blocks = measureBlocks(pn);
-      // safety net: if a page somehow overflows, split it across sheets
-      for (const part of flowIntoPages(blocks, Math.max(availableCss, 100))) pages.push(part);
+      let h = 0;
+      let cur: MeasuredBlock[] = [];
+      for (const b of blocks) {
+        if (h + b.height > availableCss && cur.length) {
+          pages.push(cur);
+          cur = [];
+          h = 0;
+        }
+        cur.push(b);
+        h += b.height;
+      }
+      if (cur.length) pages.push(cur);
     }
     if (pages.length === 0) pages.push([]);
   } else {

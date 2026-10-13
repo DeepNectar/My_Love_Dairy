@@ -571,7 +571,7 @@ function App() {
   // with big empty gaps.
   // =====================================================================
   const flowHostRef = useRef<HTMLDivElement>(null);
-  const [flowPages, setFlowPages] = useState<{ key: string; html: string; height: number }[][]>([]);
+  const [flowPages, setFlowPages] = useState<{ key: string; html: string; height: number; sliceTop?: number }[][]>([]);
   const [flowTick, setFlowTick] = useState(0);
 
   const esc = (s: string) =>
@@ -638,16 +638,33 @@ function App() {
     const host = flowHostRef.current;
     if (!host) return;
 
-    const raf = requestAnimationFrame(() => {
+    const raf = requestAnimationFrame(async () => {
       const blocks = buildBlocksHtml();
       host.innerHTML = blocks
         .map((b) => `<div data-k="${b.key}" style="width:${CONTENT_W_CSS}px;box-sizing:border-box;">${b.html}</div>`)
         .join('');
 
+      // Wait until every image inside the blocks has finished loading —
+      // measuring before images settle yields heights that are too small,
+      // which is exactly what made text overflow the page and disappear.
+      const imgs = Array.from(host.querySelectorAll('img')) as HTMLImageElement[];
+      await Promise.all(
+        imgs.map(
+          (img) =>
+            new Promise<void>((resolve) => {
+              if (img.complete && img.naturalWidth > 0) return resolve();
+              img.onload = () => resolve();
+              img.onerror = () => resolve();
+            })
+        )
+      );
+
       const measured = Array.from(host.children as HTMLCollectionOf<HTMLElement>).map((el, i) => ({
         key: blocks[i].key,
         html: blocks[i].html,
-        height: el.offsetHeight,
+        // scrollHeight is the TRUE content height even when a child is
+        // constrained, so oversized blocks are detected reliably.
+        height: Math.max(el.scrollHeight, el.offsetHeight),
       }));
 
       // Available content height inside one A4 sheet:
@@ -660,22 +677,37 @@ function App() {
       const PAGE_H = Math.round(297 * PX_PER_MM);
       const gap = Math.round(2 * PX_PER_MM);
       const pageNumberReserve = Math.round(10 * PX_PER_MM);
-      const available = PAGE_H - MARGIN * 2 - (headerH + gap) - (footerH + gap) - pageNumberReserve;
+      // tiny safety margin so rounding never pushes a line past the sheet edge
+      const available = PAGE_H - MARGIN * 2 - (headerH + gap) - (footerH + gap) - pageNumberReserve - 6;
 
-      const pages: { key: string; html: string; height: number }[][] = [];
-      let cur: { key: string; html: string; height: number }[] = [];
+      type FlowBlock = { key: string; html: string; height: number; sliceTop?: number };
+      const pages: FlowBlock[][] = [];
+      let cur: FlowBlock[] = [];
       let used = 0;
+      const pushPage = () => {
+        if (cur.length) { pages.push(cur); cur = []; used = 0; }
+      };
+
       for (const m of measured) {
-        const h = Math.min(m.height, Math.max(available, 100));
-        if (used + h > available && cur.length) {
-          pages.push(cur);
-          cur = [];
-          used = 0;
+        if (m.height > available) {
+          // Block taller than one full sheet → slice it across several pages
+          // (same offset-crop technique the PDF exporter uses). Nothing lost.
+          pushPage();
+          let offset = 0;
+          while (offset < m.height) {
+            const sliceH = Math.min(available, m.height - offset);
+            cur.push({ ...m, height: sliceH, sliceTop: offset });
+            used += sliceH;
+            if (used >= available) pushPage();
+            offset += sliceH;
+          }
+          continue;
         }
-        cur.push({ ...m, height: h });
-        used += h;
+        if (used + m.height > available) pushPage();
+        cur.push(m);
+        used += m.height;
       }
-      if (cur.length) pages.push(cur);
+      pushPage();
       if (pages.length === 0) pages.push([]);
       setFlowPages(pages);
     });
@@ -1327,9 +1359,22 @@ function App() {
                   <LoveStoryHeader />
 
                   <div className="a4-print-area">
-                    {(flowPages[currentPage] ?? []).map((b) => (
-                      <div key={b.key} dangerouslySetInnerHTML={{ __html: b.html }} />
-                    ))}
+                    {(flowPages[currentPage] ?? []).map((b) =>
+                      b.sliceTop !== undefined ? (
+                        // Oversized block sliced across pages: clip one window of it
+                        <div
+                          key={`${b.key}-${b.sliceTop}`}
+                          style={{ height: `${b.height}px`, overflow: 'hidden' }}
+                        >
+                          <div
+                            style={{ position: 'relative', top: `-${b.sliceTop}px` }}
+                            dangerouslySetInnerHTML={{ __html: b.html }}
+                          />
+                        </div>
+                      ) : (
+                        <div key={b.key} dangerouslySetInnerHTML={{ __html: b.html }} />
+                      )
+                    )}
                   </div>
 
                   {/* Footer band on EVERY page — both signatures */}
@@ -1433,9 +1478,21 @@ function App() {
           <div id="pdf-blocks" style={{ width: `${CONTENT_W_CSS}px`, fontSize: '10pt', lineHeight: 1.45, color: '#3f2a12' }}>
             {flowPages.map((pageBlocks, pi) => (
               <div key={`pp-${pi}`} data-page={pi}>
-                {pageBlocks.map((b) => (
-                  <div key={`p-${b.key}`} dangerouslySetInnerHTML={{ __html: b.html }} />
-                ))}
+                {pageBlocks.map((b) =>
+                  b.sliceTop !== undefined ? (
+                    <div
+                      key={`p-${b.key}-${b.sliceTop}`}
+                      style={{ width: `${CONTENT_W_CSS}px`, height: `${b.height}px`, overflow: 'hidden', boxSizing: 'border-box' }}
+                    >
+                      <div
+                        style={{ position: 'relative', top: `-${b.sliceTop}px`, width: `${CONTENT_W_CSS}px`, boxSizing: 'border-box' }}
+                        dangerouslySetInnerHTML={{ __html: b.html }}
+                      />
+                    </div>
+                  ) : (
+                    <div key={`p-${b.key}`} style={{ width: `${CONTENT_W_CSS}px`, boxSizing: 'border-box' }} dangerouslySetInnerHTML={{ __html: b.html }} />
+                  )
+                )}
                 {stickers.filter((s) => s.page === pi).map((s) => (
                   <div
                     key={`p-sticker-${s.id}`}

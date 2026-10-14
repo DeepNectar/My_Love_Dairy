@@ -361,10 +361,30 @@ async function waitForImages(root) {
 }
 const SHEET_PX_W = Math.round(210 * CSS_PX_PER_MM);
 const SHEET_PX_H = Math.round(297 * CSS_PX_PER_MM);
+// Replace every <img> in `root` with its inlined data: URL and WAIT until the
+// browser has actually decoded it. Without the decode step, an image that is
+// still loading when we snapshot (typical for the header photo / footer
+// signatures) silently renders as a blank rectangle in the exported PDF.
+async function inlineImagesAwaited(root) {
+  await inlineImages(root);
+  const imgs = Array.from(root.querySelectorAll("img"));
+  await Promise.all(
+    imgs.map(async (img) => {
+      try {
+        if (img.decode && !(img.complete && img.naturalWidth > 0)) await img.decode();
+      } catch {
+      }
+    })
+  );
+}
 async function renderSheetNode(node, opts) {
   beginImageRun();
-  await inlineImages(node);
-  await waitForImages(node);
+  // Inline on a throwaway clone only — never mutate the live preview DOM (the
+  // previous code stripped srcset/crossorigin from the real page images).
+  const preClone = opts?.prepare ? opts.prepare(node) : node.cloneNode(true);
+  await inlineImagesAwaited(preClone);
+  pinImageSizes(node, preClone);
+  await waitForImages(preClone);
   const prevTransform = node.style.transform;
   const prevAnimation = node.style.animation;
   node.style.transform = "none";
@@ -372,8 +392,15 @@ async function renderSheetNode(node, opts) {
   try {
     const rawClone = opts?.prepare ? opts.prepare(node) : node.cloneNode(true);
     const clone = rawClone;
-    await inlineImages(clone);
-    pinImageSizes(node, clone);
+    // Copy the already-inlined + already-decoded images straight from the
+    // pre-clone: instant, and guarantees they are painted before the snapshot.
+    const preImgs = Array.from(preClone.querySelectorAll("img"));
+    const cloneImgs = Array.from(clone.querySelectorAll("img"));
+    for (let i = 0; i < Math.min(preImgs.length, cloneImgs.length); i++) {
+      if (preImgs[i].src) cloneImgs[i].src = preImgs[i].src;
+    }
+    await inlineImagesAwaited(clone);
+    pinImageSizes(preClone, clone);
     // Render the requested page's content directly from the flow data instead of
     // forcing a React re-render + waiting for it to paint (huge speed-up and no
     // chance of capturing the wrong/previous page).
@@ -470,154 +497,43 @@ async function renderSheetNode(node, opts) {
     node.style.animation = prevAnimation;
   }
 }
-async function exportDiaryToA4Pdf(opts) {
-  if (opts.pages && opts.pages.length > 0) {
-    const pdf2 = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4", compress: true });
-    for (let i = 0; i < opts.pages.length; i++) {
-      if (i > 0) pdf2.addPage();
-      pdf2.addImage(opts.pages[i].canvas.toDataURL("image/jpeg", 0.92), "JPEG", 0, 0, A4_MM.width, A4_MM.height, void 0, "FAST");
-      opts.onPageProgress?.(i + 1, opts.pages.length);
-      await nextFrame();
-    }
-    pdf2.save(opts.fileName);
-    return opts.pages.length;
-  }
-  const container = document.querySelector(opts.blocksSelector);
-  if (!container) throw new Error("Nothing to export yet \u2014 add some entries first.");
-  beginImageRun();
-  const preparedStickers = [];
-  for (const s of opts.stickers ?? []) {
-    try {
-      const dataUrl = await toDataUrlAnyForm(s.url);
-      const img = new Image();
-      await new Promise((resolve, reject) => {
-        img.onload = () => resolve();
-        img.onerror = () => reject(new Error("sticker decode failed"));
-        img.src = dataUrl;
-      });
-      preparedStickers.push({ img, sticker: s });
-    } catch {
-      console.warn("[pdf] sticker could not be loaded:", s.url?.slice(0, 80));
-    }
-  }
-  await inlineImages(container);
-  for (const band of opts.bands ?? []) {
-    const node = document.getElementById(band.nodeId);
-    if (node) {
-      await inlineImages(node);
-      await waitForImages(node);
-    }
-  }
-  try {
-    await document.fonts?.ready;
-  } catch {
-  }
-  await nextFrame();
-  let topBand = null;
-  let bottomBand = null;
-  for (const band of opts.bands ?? []) {
-    const node = document.getElementById(band.nodeId);
-    if (!node) continue;
-    const r = await rasterizeNode(node, CONTENT_W_CSS, { prepare: opts.prepareNode });
-    if (band.position === "top") topBand = r;
-    else bottomBand = r;
-  }
-  const bandGapCss = BAND_GAP_CSS;
-  const availableCss = computeAvailableFlowHeightCss(
-    topBand ? topBand.heightCss : 0,
-    bottomBand ? bottomBand.heightCss : 0
-  );
-  const pageNodes = Array.from(container.querySelectorAll("[data-page]"));
-  let pages;
-  if (pageNodes.length > 0) {
-    pages = [];
-    for (const pn of pageNodes) {
-      for (const sub of flowIntoPages(measureBlocks(pn), Math.max(availableCss, 100))) {
-        pages.push(sub);
-      }
-    }
-    if (pages.length === 0) pages.push([]);
-  } else {
-    const blocks = measureBlocks(container).map((b) => ({ el: b.el, height: measureTrueHeight(b.el) || b.height }));
-    if (blocks.length === 0) throw new Error("No content found to export.");
-    pages = flowIntoPages(blocks, Math.max(availableCss, 100));
-  }
-  pages = pages.flatMap((pg) => {
-    const total = pg.reduce((s, b) => s + b.height, 0);
-    if (total > availableCss && pg.length > 0) return flowIntoPages(pg, Math.max(availableCss, 100));
-    return [pg];
-  });
+// Collect all page canvases into an A4 PDF as fast as possible: no per-page
+// requestAnimationFrame waits, and canvasToBlob (async JPEG encoding) is much
+// quicker than jsPDF's internal data-URL conversion for big 300-dpi canvases.
+async function assemblePdfFromCanvases(pages, fileName, onPageProgress, returnBlob) {
   const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4", compress: true });
-  const stickerPlacements = [];
-  for (const { img, sticker } of preparedStickers) {
-    for (const p of resolveStickerPlacements(sticker, pages.length)) {
-      stickerPlacements.push({ img, p });
-    }
-  }
   for (let i = 0; i < pages.length; i++) {
-    const canvas = document.createElement("canvas");
-    canvas.width = CANVAS_W;
-    canvas.height = CANVAS_H;
-    const ctx = canvas.getContext("2d");
-    ctx.fillStyle = "#ffffff";
-    ctx.fillRect(0, 0, CANVAS_W, CANVAS_H);
-    const S = PRINT_SCALE;
-    let y = MARGIN_CSS * S;
-    if (topBand) {
-      ctx.drawImage(topBand.canvas, MARGIN_CSS * S, y, CONTENT_W_CSS * S, topBand.heightCss * S);
-      y += (topBand.heightCss + bandGapCss) * S;
-    }
-    for (const b of pages[i]) {
-      const bc = await rasterizeBlock(b, opts.prepareNode);
-      const footerTopY = bottomBand ? SHEET_H_CSS - MARGIN_CSS - bottomBand.heightCss : SHEET_H_CSS - MARGIN_CSS - PAGE_NUMBER_RESERVE_CSS;
-      const drawH = Math.min(b.height, Math.max(0, footerTopY - y / S));
-      if (drawH > 1) {
-        ctx.drawImage(bc, MARGIN_CSS * S, y, CONTENT_W_CSS * S, drawH * S);
-      }
-      y += b.height * S;
-      await wait(0);
-    }
-    const pnBoxX = SHEET_W_CSS - MARGIN_CSS - PAGE_NUMBER_RESERVE_W_CSS;
-    const pnBoxY = SHEET_H_CSS - MARGIN_CSS - PAGE_NUMBER_RESERVE_CSS;
-    for (const { img, p } of stickerPlacements) {
-      if (p.page !== i) continue;
-      const wPx = p.sizePct / 100 * SHEET_W_CSS;
-      const hPx = img.naturalWidth && img.naturalHeight ? wPx * (img.naturalHeight / img.naturalWidth) : wPx;
-      const overlapsPageNumber = p.xPct < (pnBoxX + wPx) / SHEET_W_CSS * 100 && p.yPct < (pnBoxY + hPx) / SHEET_H_CSS * 100;
-      if (!overlapsPageNumber) drawStickerOnSheet(ctx, img, p);
-    }
-    if (bottomBand) {
-      const by = (SHEET_H_CSS - MARGIN_CSS - bottomBand.heightCss) * S;
-      ctx.drawImage(bottomBand.canvas, MARGIN_CSS * S, by, CONTENT_W_CSS * S, bottomBand.heightCss * S);
-    }
-    ctx.font = `${Math.round(9 * PRINT_SCALE * (96 / 72))}px Georgia, "Times New Roman", serif`;
-    ctx.fillStyle = "#92400e";
-    ctx.textAlign = "right";
-    ctx.textBaseline = "alphabetic";
-    ctx.fillText(`Page ${i + 1} of ${pages.length}`, (SHEET_W_CSS - MARGIN_CSS) * S, (SHEET_H_CSS - MARGIN_CSS * 0.4) * S);
+    const canvas = pages[i].canvas ?? pages[i];
     if (i > 0) pdf.addPage();
-    pdf.addImage(canvas.toDataURL("image/jpeg", 0.9), "JPEG", 0, 0, A4_MM.width, A4_MM.height, void 0, "FAST");
-    opts.onPageProgress?.(i + 1, pages.length);
-    await nextFrame();
+    let objUrl = null;
+    try {
+      objUrl = await new Promise((resolve, reject) => {
+        canvas.toBlob((b) => b ? resolve(URL.createObjectURL(b)) : reject(new Error("toBlob failed")), "image/jpeg", 0.92);
+      });
+    } catch {
+      objUrl = null;
+    }
+    if (objUrl) {
+      pdf.addImage(objUrl, "JPEG", 0, 0, A4_MM.width, A4_MM.height, void 0, "FAST");
+      URL.revokeObjectURL(objUrl);
+    } else {
+      pdf.addImage(canvas.toDataURL("image/jpeg", 0.92), "JPEG", 0, 0, A4_MM.width, A4_MM.height, void 0, "FAST");
+    }
+    onPageProgress?.(i + 1, pages.length);
+    // Yield so the progress UI can repaint between pages.
+    await wait(0);
   }
-  pdf.save(opts.fileName);
-  return pages.length;
-}
-async function exportPagesToA4Pdf(pageSelector, fileName) {
-  const nodes = Array.from(document.querySelectorAll(pageSelector));
-  if (nodes.length === 0) throw new Error("No pages found to export.");
-  beginImageRun();
-  for (const n of nodes) await inlineImages(n);
-  await nextFrame();
-  const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4", compress: true });
-  for (let i = 0; i < nodes.length; i++) {
-    const { canvas } = await rasterizeNode(nodes[i], SHEET_W_CSS);
-    if (i > 0) pdf.addPage();
-    pdf.addImage(canvas.toDataURL("image/jpeg", 0.9), "JPEG", 0, 0, A4_MM.width, A4_MM.height, void 0, "FAST");
-    await nextFrame();
+  if (returnBlob) {
+    return { blob: pdf.output("blob"), count: pages.length };
   }
   pdf.save(fileName);
-  return nodes.length;
+  return pages.length;
+}
+async function exportDiaryToA4Pdf(opts) {
+  if (opts.pages && opts.pages.length > 0) {
+    return assemblePdfFromCanvases(opts.pages, opts.fileName, opts.onPageProgress, opts.returnBlob);
+  }
+  throw new Error("exportDiaryToA4Pdf requires pre-rendered page canvases (render each preview sheet with renderSheetNode first).");
 }
 export {
   A4_MM,
@@ -633,8 +549,6 @@ export {
   SHEET_W_CSS,
   computeAvailableFlowHeightCss,
   exportDiaryToA4Pdf,
-  exportPagesToA4Pdf,
-  flowIntoPages,
   renderSheetNode,
   resolveStickerPlacements,
   seededRandomFrom

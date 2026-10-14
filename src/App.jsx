@@ -1,5 +1,5 @@
 import { Fragment, jsx, jsxs } from "react/jsx-runtime";
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { supabase } from "./lib/supabase";
 import Auth from "./components/Auth";
 import {
@@ -65,6 +65,9 @@ function App() {
   const [placingMode, setPlacingMode] = useState(false);
   const [exportingPdf, setExportingPdf] = useState(false);
   const [pdfProgress, setPdfProgress] = useState(null);
+  // While true, ALL diary pages are mounted off-screen so Save/Print can
+  // snapshot each one exactly like the visible preview (one page at a time).
+  const [exportAllPages, setExportAllPages] = useState(false);
   const [flipDir, setFlipDir] = useState("next");
   const pageNodeRef = useRef(null);
   useEffect(() => {
@@ -675,8 +678,13 @@ ${lines.join("\n\n")}
     setFlipDir(t > currentPage ? "next" : "prev");
     setCurrentPage(t);
   }
-  // Stickers are HARD-CODED only (see HARDCODED_STICKER_LINKS). The link-paste
-  // UI has been removed intentionally — do not re-add it.
+  const stickerToPdf = (s, _totalPages) => {
+    const page = s.page === -2 ? void 0 : s.page;
+    return { id: s.id, url: s.url, page, xPct: s.xPct, yPct: s.yPct, sizePct: s.sizePct, rotate: s.rotate };
+  };
+  // Wait until every diary image (header photo, footer signatures, stickers)
+  // has actually loaded and fonts are ready — guarantees the snapshot shows the
+  // real images instead of blank gaps.
   const waitDiaryImagesSettled = async (timeoutMs = 3e4) => {
     const start = Date.now();
     const pending = () => Array.from(document.querySelectorAll("#ls-header-measure img, #ls-footer-measure img, .a4-page img, #pdf-blocks img")).filter((im) => !(im.complete && im.naturalWidth > 0));
@@ -687,6 +695,45 @@ ${lines.join("\n\n")}
       await document.fonts?.ready;
     } catch {
     }
+  };
+  // Shared render pipeline for BOTH "Save as PDF" and "Print": every preview
+  // page is snapshotted exactly as shown (same layout, same header/footer image
+  // sizes), so the printed/saved output is pixel-identical to the preview.
+  const buildAllPagesCanvases = async () => {
+    const T = Math.max(flowPages.length, 1);
+    const placementsByPage = Array.from({ length: T }, () => []);
+    for (const s of stickers) {
+      for (const pl of resolveStickerPlacements(stickerToPdf(s, T), T)) {
+        if (pl.page >= 0 && pl.page < T) placementsByPage[pl.page].push(pl);
+      }
+    }
+    // Temporarily mount ALL pages off-screen (the preview shows one at a time).
+    setExportAllPages(true);
+    await new Promise((r) => requestAnimationFrame(() => r()));
+    await waitDiaryImagesSettled();
+    const nodes = Array.from(document.querySelectorAll(".a4-page"));
+    // The visible preview page is rendered with the same CSS as the hidden
+    // export clones, so snapshot it straight from its live DOM node.
+    const liveNode = pageNodeRef.current;
+    const canvases = [];
+    let lastDone = 0;
+    for (let p = 0; p < nodes.length; p++) {
+      const target = p === currentPage && liveNode ? liveNode : nodes[p];
+      const canvas = await renderSheetNode(target, {
+        prepare: printClone,
+        pageIndex: p,
+        flowPages,
+        stickerPlacements: placementsByPage[p] ?? []
+      });
+      canvases.push(canvas);
+      if (p + 1 === nodes.length || p + 1 - lastDone >= 3) {
+        lastDone = p + 1;
+        setPdfProgress({ done: lastDone, total: nodes.length });
+        // Yield so the progress UI repaints and the main thread stays responsive.
+        await new Promise((r) => setTimeout(r, 0));
+      }
+    }
+    return canvases;
   };
   const handleSaveAsPdf = async () => {
     if (exportingPdf) return;
@@ -699,58 +746,77 @@ ${lines.join("\n\n")}
       // stickers) so no page render ever waits on a network fetch again.
       await Promise.allSettled(stickers.map((s) => loadDataUrlCached(s.url)));
       const node = pageNodeRef.current;
-      if (node && flowPages.length > 0) {
-        // Fast path: render every A4 page straight from the DOM data — no React
-        // re-renders / forced page flips / repeated image-settled polling per page.
-        const T = Math.max(flowPages.length, 1);
-        const placementsByPage = Array.from({ length: T }, () => []);
-        for (const s of stickers) {
-          for (const pl of resolveStickerPlacements(stickerToPdf(s, T), T)) {
-            if (pl.page >= 0 && pl.page < T) placementsByPage[pl.page].push(pl);
-          }
-        }
-        const pages = [];
-        let lastDone = 0;
-        for (let p = 0; p < flowPages.length; p++) {
-          const canvas = await renderSheetNode(node, {
-            prepare: printClone,
-            pageIndex: p,
-            stickerPlacements: placementsByPage[p] ?? []
-          });
-          pages.push({ canvas });
-          // Throttle progress updates to keep the main thread free for rendering.
-          if (p + 1 === flowPages.length || p + 1 - lastDone >= 3) {
-            lastDone = p + 1;
-            setPdfProgress({ done: lastDone, total: flowPages.length });
-            await new Promise((r) => setTimeout(r, 0));
-          }
-        }
-        const n2 = await exportDiaryToA4Pdf({
-          blocksSelector: "#pdf-blocks",
-          pages,
-          fileName: `our-love-story-${(/* @__PURE__ */ new Date()).toISOString().split("T")[0]}.pdf`
-        });
-        setImportStatus({ type: "success", message: `Saved PDF with ${n2} A4 page${n2 === 1 ? "" : "s"} \u2014 identical to the preview! \u{1F495}` });
-        return;
+      if (!node || flowPages.length === 0) {
+        throw new Error("Nothing to export yet \u2014 add some entries first.");
       }
+      const canvases = await buildAllPagesCanvases();
       const n = await exportDiaryToA4Pdf({
-        blocksSelector: "#pdf-blocks",
-        bands: [
-          { nodeId: "ls-header-print", position: "top" },
-          { nodeId: "ls-footer-print", position: "bottom" }
-        ],
-        stickers: stickers.map((s) => stickerToPdf(s, Math.max(flowPages.length, 1))),
-        // Rasterize clean clones (no hover/nudge buttons) so the PDF shows
-        // exactly the visual preview of each page.
-        prepareNode: printClone,
+        pages: canvases.map((canvas) => ({ canvas })),
         fileName: `our-love-story-${(/* @__PURE__ */ new Date()).toISOString().split("T")[0]}.pdf`,
         onPageProgress: (done, total) => setPdfProgress({ done, total })
       });
-      setImportStatus({ type: "success", message: `Saved PDF with ${n} A4 page${n === 1 ? "" : "s"}! \u{1F495}` });
+      setImportStatus({ type: "success", message: `Saved PDF with ${n} A4 page${n === 1 ? "" : "s"} \u2014 identical to the preview! \u{1F495}` });
     } catch (err) {
       console.error(err);
       setImportStatus({ type: "error", message: err?.message || "Failed to export PDF." });
     } finally {
+      setExportAllPages(false);
+      setExportingPdf(false);
+      setPdfProgress(null);
+    }
+  };
+  const handlePrint = async () => {
+    if (exportingPdf) return;
+    setExportingPdf(true);
+    setShowMenu(false);
+    setPlacingMode(false);
+    setPdfProgress(null);
+    try {
+      await Promise.allSettled(stickers.map((s) => loadDataUrlCached(s.url)));
+      const node = pageNodeRef.current;
+      if (!node || flowPages.length === 0) {
+        throw new Error("Nothing to print yet \u2014 add some entries first.");
+      }
+      const canvases = await buildAllPagesCanvases();
+      const n = await exportDiaryToA4Pdf({
+        pages: canvases.map((canvas) => ({ canvas })),
+        fileName: `our-love-story-${(/* @__PURE__ */ new Date()).toISOString().split("T")[0]}.pdf`,
+        onPageProgress: (done, total) => setPdfProgress({ done, total }),
+        returnBlob: true
+      });
+      const blob = n.blob;
+      const url = URL.createObjectURL(blob);
+      // Hidden iframe → print dialog with the EXACT same PDF bytes that
+      // "Save as PDF" produces (no browser re-layout differences).
+      const frame = document.createElement("iframe");
+      frame.style.position = "fixed";
+      frame.style.right = "0";
+      frame.style.bottom = "0";
+      frame.style.width = "0";
+      frame.style.height = "0";
+      frame.style.border = "0";
+      frame.setAttribute("aria-hidden", "true");
+      frame.src = url;
+      frame.onload = () => {
+        try {
+          frame.contentWindow?.focus();
+          frame.contentWindow?.print();
+        } catch (e) {
+          console.error("Print failed:", e);
+          setImportStatus({ type: "error", message: "Could not open the print dialog. Try Save as PDF instead." });
+        }
+        setTimeout(() => {
+          frame.remove();
+          URL.revokeObjectURL(url);
+        }, 6e4);
+      };
+      document.body.appendChild(frame);
+      setImportStatus({ type: "success", message: `Opening print preview for ${canvases.length} A4 page${canvases.length === 1 ? "" : "s"}\u2026 \u{1F5A8}\uFE0F` });
+    } catch (err) {
+      console.error(err);
+      setImportStatus({ type: "error", message: err?.message || "Failed to print." });
+    } finally {
+      setExportAllPages(false);
       setExportingPdf(false);
       setPdfProgress(null);
     }

@@ -71,11 +71,19 @@ function blobToDataUrl(blob) {
   });
 }
 const inflight = /* @__PURE__ */ new Map();
+// Keep resolved data URLs around for the whole session: repeated "Save as PDF"
+// / "Print" runs then need ZERO network fetches, which makes exports much faster.
+const resolvedCache = /* @__PURE__ */ new Map();
 function loadDataUrlCached(url) {
   const key = url;
+  const done = resolvedCache.get(key);
+  if (done) return Promise.resolve(done);
   const existing = inflight.get(key);
   if (existing) return existing;
-  const p = loadImageAsDataUrl(url).finally(() => {
+  const p = loadImageAsDataUrl(url).then((d) => {
+    resolvedCache.set(key, d);
+    return d;
+  }).finally(() => {
     if (inflight.get(key) === p) inflight.delete(key);
   });
   inflight.set(key, p);
@@ -97,6 +105,12 @@ function RobustImg({
     setIdx(0);
     setFinalSrc(null);
     triedRef.current = 0;
+    // If a previous fetch already resolved this image (e.g. the PDF export or
+    // the print flow ran before), show it instantly instead of re-trying every
+    // remote candidate — this is what makes header/footer/sticker photos appear
+    // in the preview reliably and quickly.
+    loadDataUrlCached(src).then((d) => setFinalSrc((prev) => prev ?? d)).catch(() => {
+    });
   }, [src]);
   const current = finalSrc ?? candidates[Math.min(idx, candidates.length - 1)];
   const handleError = useCallback(() => {
@@ -112,10 +126,7 @@ function RobustImg({
     "img",
     {
       src: current,
-      srcSet: candidates.map((c, i) => `${c} ${Math.round(widthHint * Math.pow(2, i))}w`).join(", "),
-      sizes: "100vw",
       alt,
-      crossOrigin: "anonymous",
       draggable,
       className,
       style,

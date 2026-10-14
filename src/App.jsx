@@ -828,10 +828,6 @@ ${lines.join("\n\n")}
       return resolveStickerPlacements(stickerToPdf(s, T), T).some((pl) => pl.page === currentPage);
     });
   })();
-  const stickerToPdf = (s, _totalPages) => {
-    const page = s.page === -2 ? void 0 : s.page;
-    return { id: s.id, url: s.url, page, xPct: s.xPct, yPct: s.yPct, sizePct: s.sizePct, rotate: s.rotate };
-  };
   const stickerStyle = (s) => {
     const T = Math.max(flowPages.length, 1);
     if (s.page >= 0) {

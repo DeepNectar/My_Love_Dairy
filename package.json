@@ -5,7 +5,6 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "typecheck": "tsc --noEmit",
     "create-auth-user": "node scripts/create-auth-user.mjs"
   },
   "dependencies": {

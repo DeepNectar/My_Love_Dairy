@@ -65,21 +65,20 @@
   margin-bottom: 2mm;
   break-after: avoid;
 }
-/* Normal (plain) photo — no box border, sized to sit neatly inside the header band */
 .ls-header-photo {
   flex: 0 0 auto;
-  width: 32mm;
-  height: 32mm;
-  border-radius: 0;
+  width: 26mm;
+  height: 26mm;
+  border-radius: 10px;
   overflow: hidden;
-  border: none;
-  box-shadow: none;
-  background: transparent;
+  border: 2px solid #fb7185;
+  box-shadow: 0 2px 6px rgba(190, 24, 93, 0.25);
+  background: #fff1f2;
 }
 .ls-header-photo img {
   width: 100%;
   height: 100%;
-  object-fit: cover;   /* fills the 32mm square exactly — fits perfectly in the header */
+  object-fit: cover;
   display: block;
 }
 .ls-header-text { flex: 1 1 auto; min-width: 0; text-align: center; }
@@ -130,15 +129,10 @@
   text-align: center;
 }
 .ls-sign img {
-  /* Fit the footer band exactly: each signature occupies a neat 58×14mm box,
-     scaled proportionally (contain) and centred — never overflowing the page
-     bottom or overlapping the "Page N of M" number in site preview or PDF. */
-  width: 58mm;
-  height: 14mm;
+  max-height: 17mm;
   max-width: 100%;
-  object-fit: contain;
+  width: auto;
   display: block;
-  margin: 0 auto;
   filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.15));
 }
 
@@ -212,63 +206,6 @@
   margin: 6px 0 6px;
   break-after: avoid;
 }
-.pg-hnum {
-  display: inline-block;
-  background: #f59e0b;
-  color: #fff;
-  border-radius: 9999px;
-  min-width: 20px;
-  text-align: center;
-  font-size: 10pt;
-  padding: 1px 6px;
-  margin-right: 6px;
-}
-.pg-hcount {
-  font-size: 9pt;
-  font-weight: 400;
-  color: #a16207;
-  margin-left: 6px;
-}
-.pg-summary-title { border-bottom-color: #f472b6; }
-.pg-sender-label { color: #be123c; }
-.pg-sender { color: #9d174d; }
-.pg-feel-label { color: #9a3412; }
-
-/* Cover block (first page) */
-.pg-cover {
-  text-align: center;
-  border: 2.5px solid #fda4af;
-  border-radius: 10px;
-  padding: 14px 12px;
-  margin-bottom: 8px;
-  background: linear-gradient(135deg, #fff1f2, #fff7ed);
-}
-.pg-cover-emoji { font-size: 26pt; line-height: 1.2; }
-.pg-cover-title {
-  font-family: Georgia, 'Times New Roman', serif;
-  font-size: 17pt;
-  font-weight: 800;
-  color: #be123c;
-  margin: 4px 0;
-}
-.pg-cover-sub { font-size: 11pt; font-weight: 700; color: #9d174d; margin: 2px 0 6px; }
-.pg-cover-rule { color: #f59e0b; font-weight: 800; letter-spacing: -1px; overflow-wrap: anywhere; font-size: 9pt; }
-.pg-cover-date { font-size: 10pt; color: #78350f; margin: 4px 0; }
-.pg-cover-note { font-size: 8.5pt; font-style: italic; color: #a16207; margin: 2px 0 0; }
-
-/* Final summary block */
-.pg-summary-list { list-style: none; margin: 0; padding: 0; }
-.pg-summary-list li {
-  display: flex;
-  gap: 6px;
-  font-size: 9.5pt;
-  color: #451a03;
-  margin-bottom: 4px;
-  line-height: 1.4;
-}
-.pg-bullet { color: #ec4899; font-weight: 800; flex: 0 0 auto; }
-.pg-sum-end { text-align: center; color: #f59e0b; font-weight: 800; overflow-wrap: anywhere; font-size: 9pt; margin: 6px 0; }
-
 .pg-entry {
   border: 1px solid #f3d9a4;
   border-radius: 6px;

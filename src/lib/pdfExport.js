@@ -1,5 +1,5 @@
 import { jsPDF } from "jspdf";
-import { loadDataUrlCached, driveIdFromLink } from "./images";
+import { loadDataUrlCached } from "./images";
 const A4_MM = { width: 210, height: 297 };
 const NARROW_MARGIN_MM = 8;
 const CSS_PX_PER_MM = 96 / 25.4;
@@ -55,19 +55,25 @@ async function nextFrame() {
   await new Promise((resolve) => requestAnimationFrame(() => resolve()));
   await wait(0);
 }
+// Per-export resolved cache: one URL is fetched ONCE per export run instead of
+// once per page — the header photo & both footer signatures used to be re-fetched
+// for every single A4 page, which made saving the PDF extremely slow.
+let runCache = null;
+function beginImageRun() {
+  runCache = /* @__PURE__ */ new Map();
+}
 async function toDataUrlAnyForm(ref) {
-  const attempts = [ref];
-  const id = driveIdFromLink(ref);
-  if (id && !/^https?:/i.test(ref)) attempts.push(`https://drive.google.com/thumbnail?id=${id}&sz=w1600`);
-  let lastErr = null;
-  for (const a of attempts) {
-    try {
-      return await loadDataUrlCached(a);
-    } catch (err) {
-      lastErr = err;
-    }
+  const cache = runCache ?? loadDataUrlCached(ref);
+  if (!(cache instanceof Promise)) {
+    if (cache.has(ref)) return cache.get(ref);
+    const p = loadDataUrlCached(ref).catch((err) => {
+      cache.delete(ref);
+      throw err;
+    });
+    cache.set(ref, p);
+    return p;
   }
-  throw lastErr instanceof Error ? lastErr : new Error("Could not load sticker image");
+  return cache;
 }
 async function hydrateStickerImg(img, url) {
   const dataUrl = await toDataUrlAnyForm(url);
@@ -75,6 +81,8 @@ async function hydrateStickerImg(img, url) {
     img.onload = () => resolve();
     img.onerror = () => resolve();
     img.removeAttribute("crossorigin");
+    img.removeAttribute("srcset");
+    img.removeAttribute("sizes");
     img.src = dataUrl;
   });
 }
@@ -87,6 +95,8 @@ async function inlineImages(root) {
       try {
         await hydrateStickerImg(img, src);
       } catch {
+        // Keep the original src as a last resort: if it already loaded in the
+        // browser cache, html2canvas-style SVG rasterisation can still use it.
       }
     })
   );
@@ -227,6 +237,11 @@ async function rasterizeNode(el, widthCss, opts) {
   const heightCss = isSlice ? opts.heightOverride : el.offsetHeight || el.scrollHeight;
   const rawClone = opts?.prepare ? opts.prepare(el) : el.cloneNode(true);
   const clone = rawClone;
+  // Make sure every <img> inside the clone carries an inlined data: URL — SVG
+  // foreignObject rasterisation cannot load remote/CORS images, so without this
+  // step header photos, footer signatures and sticker pictures silently vanish
+  // from the exported PDF.
+  await inlineImages(clone);
   pinImageSizes(el, clone);
   clone.style.width = `${widthCss}px`;
   if (isSlice) {
@@ -347,6 +362,7 @@ async function waitForImages(root) {
 const SHEET_PX_W = Math.round(210 * CSS_PX_PER_MM);
 const SHEET_PX_H = Math.round(297 * CSS_PX_PER_MM);
 async function renderSheetNode(node, opts) {
+  beginImageRun();
   await inlineImages(node);
   await waitForImages(node);
   const prevTransform = node.style.transform;
@@ -356,7 +372,73 @@ async function renderSheetNode(node, opts) {
   try {
     const rawClone = opts?.prepare ? opts.prepare(node) : node.cloneNode(true);
     const clone = rawClone;
+    await inlineImages(clone);
     pinImageSizes(node, clone);
+    // Render the requested page's content directly from the flow data instead of
+    // forcing a React re-render + waiting for it to paint (huge speed-up and no
+    // chance of capturing the wrong/previous page).
+    if (typeof opts?.pageIndex === "number" && Array.isArray(opts.flowPages)) {
+      const area = clone.querySelector(".a4-print-area");
+      if (area) {
+        area.innerHTML = "";
+        for (const b of opts.flowPages[opts.pageIndex] ?? []) {
+          if (b.sliceTop !== void 0) {
+            const outer = document.createElement("div");
+            outer.style.height = `${b.height}px`;
+            outer.style.overflow = "hidden";
+            const innerDiv = document.createElement("div");
+            innerDiv.style.position = "relative";
+            innerDiv.style.top = `-${b.sliceTop}px`;
+            innerDiv.innerHTML = b.html;
+            outer.appendChild(innerDiv);
+            area.appendChild(outer);
+          } else {
+            const d = document.createElement("div");
+            d.innerHTML = b.html;
+            area.appendChild(d);
+          }
+        }
+      }
+      const pn = clone.querySelector(".a4-page-number");
+      if (pn) {
+        pn.textContent = `Page ${opts.pageIndex + 1} of ${Math.max(opts.flowPages.length, 1)}`;
+      }
+    }
+    // Hard-coded stickers: draw them on the cloned sheet at their resolved
+    // positions so the exported PDF matches the on-screen preview exactly.
+    if (Array.isArray(opts?.stickerPlacements) && opts.stickerPlacements.length) {
+      const host = document.createElement("div");
+      host.style.position = "absolute";
+      host.style.inset = "0";
+      host.style.pointerEvents = "none";
+      host.style.zIndex = "3";
+      for (const pl of opts.stickerPlacements) {
+        let dataUrl = null;
+        try {
+          dataUrl = await toDataUrlAnyForm(pl.url);
+        } catch {
+          console.warn("[pdf] sticker could not be inlined:", String(pl.url).slice(0, 80));
+        }
+        if (!dataUrl) continue;
+        const wrap = document.createElement("div");
+        wrap.style.position = "absolute";
+        wrap.style.left = `${pl.xPct}%`;
+        wrap.style.top = `${pl.yPct}%`;
+        wrap.style.width = `${pl.sizePct}%`;
+        wrap.style.transform = `rotate(${pl.rotate}deg)`;
+        const im = document.createElement("img");
+        im.src = dataUrl;
+        im.style.display = "block";
+        im.style.width = "100%";
+        im.style.height = "auto";
+        im.style.border = "3px solid #fff";
+        im.style.borderRadius = "8px";
+        im.style.boxShadow = "0 0 0 1px rgba(180, 83, 9, 0.35), 0 3px 6px rgba(0,0,0,0.3)";
+        wrap.appendChild(im);
+        host.appendChild(wrap);
+      }
+      clone.appendChild(host);
+    }
     clone.style.width = `${SHEET_PX_W}px`;
     clone.style.height = `${SHEET_PX_H}px`;
     clone.style.boxSizing = "border-box";
@@ -402,6 +484,7 @@ async function exportDiaryToA4Pdf(opts) {
   }
   const container = document.querySelector(opts.blocksSelector);
   if (!container) throw new Error("Nothing to export yet \u2014 add some entries first.");
+  beginImageRun();
   const preparedStickers = [];
   for (const s of opts.stickers ?? []) {
     try {
@@ -523,6 +606,7 @@ async function exportDiaryToA4Pdf(opts) {
 async function exportPagesToA4Pdf(pageSelector, fileName) {
   const nodes = Array.from(document.querySelectorAll(pageSelector));
   if (nodes.length === 0) throw new Error("No pages found to export.");
+  beginImageRun();
   for (const n of nodes) await inlineImages(n);
   await nextFrame();
   const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4", compress: true });

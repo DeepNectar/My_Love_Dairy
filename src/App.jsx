@@ -22,6 +22,18 @@ function printClone(node) {
   return c;
 }
 const STICKERS_KEY = "diary_stickers_v1";
+// HARD-CODED sticker policy: stickers are disabled in the UI. The only way to
+// add one is by editing HARDCODED_STICKERS below (links will be provided later).
+// Set entries here and they will render on every page & appear in the PDF.
+const HARDCODED_STICKER_LINKS = [];
+const HARDCODED_STICKERS = HARDCODED_STICKER_LINKS.map((link, i) => ({
+  id: `hardcoded-${i}`,
+  url: resolveImageUrl(link),
+  // page -2 = scatter across ALL pages at deterministic seeded positions
+  page: -2,
+  sizePct: 12,
+  rotate: -4 + i * 7 % 9
+}));
 const SHEET_ASPECT_MM = 297 / 210;
 const STICKER_MAX_Y_PCT = 86;
 function App() {
@@ -43,7 +55,9 @@ function App() {
   const [currentPage, setCurrentPage] = useState(0);
   const [sheetScale, setSheetScale] = useState(1);
   const sheetWrapRef = useRef(null);
-  const [stickers, setStickers] = useState(() => readLocalSessionItem(STICKERS_KEY, []));
+  // Stickers are hard-coded only — any stickers previously saved from the (now
+  // removed) UI are ignored on load.
+  const [stickers, setStickers] = useState(HARDCODED_STICKERS);
   const [showStickerModal, setShowStickerModal] = useState(false);
   const [stickerUrl, setStickerUrl] = useState("");
   const [stickerSize, setStickerSize] = useState(25);
@@ -624,9 +638,13 @@ ${lines.join("\n\n")}
   useEffect(() => {
     if (currentPage > totalPages - 1) setCurrentPage(Math.max(0, totalPages - 1));
   }, [totalPages, currentPage]);
+  // Stickers are hard-coded only — nothing is persisted from the UI any more.
   useEffect(() => {
-    writeLocalSessionItem(STICKERS_KEY, stickers);
-  }, [stickers]);
+    try {
+      localStorage.removeItem(STICKERS_KEY);
+    } catch {
+    }
+  }, []);
   useEffect(() => {
     const el = sheetWrapRef.current;
     if (!el) return;
@@ -657,36 +675,8 @@ ${lines.join("\n\n")}
     setFlipDir(t > currentPage ? "next" : "prev");
     setCurrentPage(t);
   }
-  const addStickerAt = (opts) => {
-    const raw = stickerUrl.trim();
-    if (!raw) return;
-    const url = resolveImageUrl(raw);
-    const scattered = opts.page === void 0;
-    const s = {
-      id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-      url,
-      page: opts.page ?? -1,
-      // -1 = "one randomly chosen page" (see resolveStickerPlacements)
-      xPct: opts.xPct !== void 0 ? Math.max(2, Math.min(opts.xPct, 98 - stickerSize)) : void 0,
-      yPct: opts.yPct !== void 0 ? Math.max(2, Math.min(opts.yPct, 95)) : void 0,
-      sizePct: scattered ? Math.min(stickerSize, 14) : stickerSize,
-      rotate: stickerRotate
-    };
-    setStickers((prev) => [...prev, s]);
-    setPlacingMode(false);
-    setShowStickerModal(false);
-    setStickerUrl("");
-    setImportStatus({
-      type: "success",
-      message: scattered ? "Sticker added on a random page \u2014 it will appear in the PDF too! \u{1F495}" : "Sticker added! It will appear in the PDF too."
-    });
-  };
-  const removeSticker = (id) => setStickers((prev) => prev.filter((s) => s.id !== id));
-  const moveSticker = (id, dxPct, dyPct) => setStickers(
-    (prev) => prev.map(
-      (s) => s.id === id ? { ...s, xPct: Math.max(0, Math.min(100 - s.sizePct, (s.xPct ?? 0) + dxPct)), yPct: Math.max(0, Math.min(97, (s.yPct ?? 0) + dyPct)) } : s
-    )
-  );
+  // Stickers are HARD-CODED only (see HARDCODED_STICKER_LINKS). The link-paste
+  // UI has been removed intentionally — do not re-add it.
   const waitDiaryImagesSettled = async (timeoutMs = 3e4) => {
     const start = Date.now();
     const pending = () => Array.from(document.querySelectorAll("#ls-header-measure img, #ls-footer-measure img, .a4-page img, #pdf-blocks img")).filter((im) => !(im.complete && im.naturalWidth > 0));
@@ -705,19 +695,35 @@ ${lines.join("\n\n")}
     setPlacingMode(false);
     setPdfProgress(null);
     try {
+      // Pre-warm the image cache ONCE (header photo, footer signatures, hard-coded
+      // stickers) so no page render ever waits on a network fetch again.
       await Promise.allSettled(stickers.map((s) => loadDataUrlCached(s.url)));
-      await waitDiaryImagesSettled();
       const node = pageNodeRef.current;
       if (node && flowPages.length > 0) {
+        // Fast path: render every A4 page straight from the DOM data — no React
+        // re-renders / forced page flips / repeated image-settled polling per page.
+        const T = Math.max(flowPages.length, 1);
+        const placementsByPage = Array.from({ length: T }, () => []);
+        for (const s of stickers) {
+          for (const pl of resolveStickerPlacements(stickerToPdf(s, T), T)) {
+            if (pl.page >= 0 && pl.page < T) placementsByPage[pl.page].push(pl);
+          }
+        }
         const pages = [];
+        let lastDone = 0;
         for (let p = 0; p < flowPages.length; p++) {
-          setCurrentPage(p);
-          await new Promise((resolve) => requestAnimationFrame(() => resolve()));
-          await new Promise((r) => setTimeout(r, 60));
-          await waitDiaryImagesSettled(15e3);
-          pages.push({ canvas: await renderSheetNode(node, { prepare: printClone }) });
-          setPdfProgress({ done: p + 1, total: flowPages.length });
-          await new Promise((r) => setTimeout(r, 0));
+          const canvas = await renderSheetNode(node, {
+            prepare: printClone,
+            pageIndex: p,
+            stickerPlacements: placementsByPage[p] ?? []
+          });
+          pages.push({ canvas });
+          // Throttle progress updates to keep the main thread free for rendering.
+          if (p + 1 === flowPages.length || p + 1 - lastDone >= 3) {
+            lastDone = p + 1;
+            setPdfProgress({ done: lastDone, total: flowPages.length });
+            await new Promise((r) => setTimeout(r, 0));
+          }
         }
         const n2 = await exportDiaryToA4Pdf({
           blocksSelector: "#pdf-blocks",

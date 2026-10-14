@@ -529,11 +529,96 @@ async function assemblePdfFromCanvases(pages, fileName, onPageProgress, returnBl
   pdf.save(fileName);
   return pages.length;
 }
+// Legacy DOM-based path: measure the #pdf-blocks container (or explicit page
+// nodes), flow the blocks into A4 sheets and rasterise them one by one. Used
+// as a fallback when no pre-rendered page canvases are supplied, so exporting
+// never fails with "requires pre-rendered page canvases".
+async function collectBlocks(container) {
+  const pageNodes = Array.from(container.querySelectorAll("[data-page]"));
+  const sources = pageNodes.length ? pageNodes : [container];
+  const blocks = [];
+  for (const src of sources) {
+    for (const el of Array.from(src.children)) {
+      const h = el.offsetHeight || el.scrollHeight;
+      if (h > 0) blocks.push({ el, height: h });
+    }
+  }
+  return blocks;
+}
+async function exportDomBased(opts) {
+  beginImageRun();
+  const container = document.querySelector(opts.blocksSelector);
+  if (!container) throw new Error("Nothing to export yet \u2014 add some entries first.");
+  await inlineImagesAwaited(container);
+  for (const band of opts.bands ?? []) {
+    const node = document.getElementById(band.nodeId);
+    if (node) await inlineImagesAwaited(node);
+  }
+  let topBand = null;
+  let bottomBand = null;
+  for (const band of opts.bands ?? []) {
+    const node = document.getElementById(band.nodeId);
+    if (!node) continue;
+    const r = await rasterizeNode(node, CONTENT_W_CSS);
+    if (band.position === "top") topBand = r;
+    else bottomBand = r;
+  }
+  const topUsed = topBand ? topBand.heightCss + BAND_GAP_CSS : 0;
+  const bottomUsed = (bottomBand ? bottomBand.heightCss + BAND_GAP_CSS : 0) + PAGE_NUMBER_RESERVE_CSS;
+  const availableCss = SHEET_H_CSS - MARGIN_CSS * 2 - topUsed - bottomUsed;
+  const blocks = await collectBlocks(container);
+  if (blocks.length === 0) throw new Error("No content found to export.");
+  const pages = flowIntoPages(blocks, Math.max(availableCss, 100));
+  const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4", compress: true });
+  for (let i = 0; i < pages.length; i++) {
+    const canvas = document.createElement("canvas");
+    canvas.width = CANVAS_W;
+    canvas.height = CANVAS_H;
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    const S = PRINT_SCALE;
+    let y = MARGIN_CSS * S;
+    if (topBand) {
+      ctx.drawImage(topBand.canvas, MARGIN_CSS * S, y, CONTENT_W_CSS * S, topBand.heightCss * S);
+      y += (topBand.heightCss + BAND_GAP_CSS) * S;
+    }
+    for (const b of pages[i]) {
+      const bc = await rasterizeBlock(b);
+      ctx.drawImage(bc, MARGIN_CSS * S, y, CONTENT_W_CSS * S, b.height * S);
+      y += b.height * S;
+      await wait(0);
+    }
+    if (bottomBand) {
+      const by = (SHEET_H_CSS - MARGIN_CSS - bottomBand.heightCss) * S;
+      ctx.drawImage(bottomBand.canvas, MARGIN_CSS * S, by, CONTENT_W_CSS * S, bottomBand.heightCss * S);
+    }
+    ctx.font = `${Math.round(9 * PRINT_SCALE * (96 / 72))}px Georgia, "Times New Roman", serif`;
+    ctx.fillStyle = "#92400e";
+    ctx.textAlign = "right";
+    ctx.textBaseline = "alphabetic";
+    ctx.fillText(`Page ${i + 1} of ${pages.length}`, (SHEET_W_CSS - MARGIN_CSS) * S, (SHEET_H_CSS - MARGIN_CSS * 0.4) * S);
+    if (i > 0) pdf.addPage();
+    pdf.addImage(canvas.toDataURL("image/jpeg", 0.9), "JPEG", 0, 0, A4_MM.width, A4_MM.height, void 0, "FAST");
+    opts.onPageProgress?.(i + 1, pages.length);
+    await nextFrame();
+  }
+  if (opts.returnBlob) {
+    return { blob: pdf.output("blob"), count: pages.length };
+  }
+  pdf.save(opts.fileName);
+  return pages.length;
+}
 async function exportDiaryToA4Pdf(opts) {
   if (opts.pages && opts.pages.length > 0) {
     return assemblePdfFromCanvases(opts.pages, opts.fileName, opts.onPageProgress, opts.returnBlob);
   }
-  throw new Error("exportDiaryToA4Pdf requires pre-rendered page canvases (render each preview sheet with renderSheetNode first).");
+  // No pre-rendered canvases supplied: fall back to the legacy DOM pipeline
+  // instead of throwing, so "Save as PDF" always works.
+  if (opts.blocksSelector) {
+    return exportDomBased(opts);
+  }
+  throw new Error("Nothing to export yet \u2014 add some diary entries first.");
 }
 export {
   A4_MM,

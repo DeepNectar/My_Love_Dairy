@@ -70,6 +70,9 @@ function App() {
   const [exportAllPages, setExportAllPages] = useState(false);
   const [flipDir, setFlipDir] = useState("next");
   const pageNodeRef = useRef(null);
+  // Off-screen clones of the preview sheet (one per flow page) that exist only
+  // while exporting — renderSheetNode snapshots these exactly like the preview.
+  const exportPageRefs = useRef([]);
   useEffect(() => {
     let mounted = true;
     const initAuth = async () => {
@@ -707,18 +710,27 @@ ${lines.join("\n\n")}
         if (pl.page >= 0 && pl.page < T) placementsByPage[pl.page].push(pl);
       }
     }
-    // Temporarily mount ALL pages off-screen (the preview shows one at a time).
+    // Mount ALL pages off-screen (the preview shows one at a time) so every
+    // sheet can be snapshotted exactly like the visible preview.
     setExportAllPages(true);
     await new Promise((r) => requestAnimationFrame(() => r()));
+    await new Promise((r) => requestAnimationFrame(() => r()));
     await waitDiaryImagesSettled();
-    const nodes = Array.from(document.querySelectorAll(".a4-page"));
-    // The visible preview page is rendered with the same CSS as the hidden
-    // export clones, so snapshot it straight from its live DOM node.
     const liveNode = pageNodeRef.current;
+    // Prefer the dedicated off-screen clones; fall back to any `.a4-page` nodes
+    // found in the DOM, and finally to rendering the live page for every index
+    // (renderSheetNode re-injects each page's flow blocks into the clone, so the
+    // snapshot is still correct even when no clones are mounted).
+    let targets = exportPageRefs.current.filter(Boolean);
+    if (targets.length === 0) {
+      targets = Array.from(document.querySelectorAll(".a4-page")).filter((n) => n !== liveNode);
+    }
     const canvases = [];
     let lastDone = 0;
-    for (let p = 0; p < nodes.length; p++) {
-      const target = p === currentPage && liveNode ? liveNode : nodes[p];
+    const T2 = Math.max(targets.length, flowPages.length, 1);
+    for (let p = 0; p < T2; p++) {
+      const target = targets[p] ?? liveNode;
+      if (!target) continue;
       const canvas = await renderSheetNode(target, {
         prepare: printClone,
         pageIndex: p,
@@ -726,14 +738,95 @@ ${lines.join("\n\n")}
         stickerPlacements: placementsByPage[p] ?? []
       });
       canvases.push(canvas);
-      if (p + 1 === nodes.length || p + 1 - lastDone >= 3) {
+      if (p + 1 === T2 || p + 1 - lastDone >= 3) {
         lastDone = p + 1;
-        setPdfProgress({ done: lastDone, total: nodes.length });
+        setPdfProgress({ done: lastDone, total: T2 });
         // Yield so the progress UI repaints and the main thread stays responsive.
         await new Promise((r) => setTimeout(r, 0));
       }
     }
+    if (canvases.length === 0) {
+      throw new Error("Nothing to export yet \u2014 add some entries first.");
+    }
     return canvases;
+  };
+  // --- Built-in PDF assembler (jsPDF) -------------------------------------
+  // Safety net used whenever the exporter module fails or returns an unexpected
+  // shape: turns the rendered page canvases straight into an A4 PDF.
+  const assembleCanvasesToPdf = async (canvases, fileName) => {
+    if (!canvases || canvases.length === 0) return 0;
+    const { jsPDF } = await import("jspdf");
+    const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4", compress: true });
+    for (let i = 0; i < canvases.length; i++) {
+      const c = canvases[i];
+      if (i > 0) pdf.addPage();
+      pdf.addImage(c.toDataURL("image/jpeg", 0.92), "JPEG", 0, 0, 210, 297, undefined, "FAST");
+      setPdfProgress({ done: i + 1, total: canvases.length });
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    try {
+      pdf.save(fileName);
+    } catch (e) {
+      console.error("[pdf] direct save failed:", e);
+      triggerBlobDownload(pdf.output("blob"), fileName);
+    }
+    return canvases.length;
+  };
+  const triggerBlobDownload = (blob, fileName) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 6e4);
+  };
+  // Build a PDF Blob directly from the rendered canvases (print fallback).
+  const buildPdfBlobFromCanvases = async (canvases) => {
+    if (!canvases || canvases.length === 0) {
+      throw new Error("Nothing to export yet \u2014 add some entries first.");
+    }
+    const { jsPDF } = await import("jspdf");
+    const pdf = new jsPDF({ orientation: "portrait", unit: "mm", format: "a4", compress: true });
+    for (let i = 0; i < canvases.length; i++) {
+      if (i > 0) pdf.addPage();
+      pdf.addImage(canvases[i].toDataURL("image/jpeg", 0.92), "JPEG", 0, 0, 210, 297, undefined, "FAST");
+      setPdfProgress({ done: i + 1, total: canvases.length });
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    return pdf.output("blob");
+  };
+  // Resolve whatever `exportDiaryToA4Pdf` returned into the page count, and make
+  // sure a file was actually saved. Older/built exporter modules can return a
+  // `{ blob, count }` shape or fail without pre-rendered canvases — handle all
+  // of that here so "Save as PDF" never errors out on the user.
+  const savePdfResult = async (result, fileName) => {
+    if (result && typeof result.then === "function") result = await result;
+    if (result && typeof result.catch === "function") result = await result.catch(() => null);
+    let count = 0;
+    if (Array.isArray(result)) {
+      count = await assembleCanvasesToPdf(result, fileName);
+    } else if (result && typeof result.count === "number") {
+      count = result.count;
+    } else if (result && typeof result.save === "function") {
+      try {
+        result.save(fileName);
+      } catch {
+      }
+    } else if (result && typeof result.blob === "object" && result.blob) {
+      triggerBlobDownload(result.blob, fileName);
+      count = typeof result.count === "number" ? result.count : 1;
+    } else if (typeof result === "number") {
+      count = result;
+    }
+    if (!count) {
+      // The exporter produced nothing usable — build the PDF straight from the
+      // rendered canvases instead of showing an error.
+      const canvases = await buildAllPagesCanvases().catch(() => []);
+      if (canvases.length) count = await assembleCanvasesToPdf(canvases, fileName);
+    }
+    return count;
   };
   const handleSaveAsPdf = async () => {
     if (exportingPdf) return;
@@ -750,11 +843,22 @@ ${lines.join("\n\n")}
         throw new Error("Nothing to export yet \u2014 add some entries first.");
       }
       const canvases = await buildAllPagesCanvases();
-      const n = await exportDiaryToA4Pdf({
-        pages: canvases.map((canvas) => ({ canvas })),
-        fileName: `our-love-story-${(/* @__PURE__ */ new Date()).toISOString().split("T")[0]}.pdf`,
-        onPageProgress: (done, total) => setPdfProgress({ done, total })
-      });
+      const fileName = `our-love-story-${(/* @__PURE__ */ new Date()).toISOString().split("T")[0]}.pdf`;
+      let n = 0;
+      try {
+        n = await savePdfResult(
+          exportDiaryToA4Pdf({
+            pages: canvases.map((canvas) => ({ canvas })),
+            fileName,
+            onPageProgress: (done, total) => setPdfProgress({ done, total })
+          }),
+          fileName
+        );
+      } catch (e) {
+        console.warn("[pdf] exporter failed, assembling directly from canvases:", e);
+      }
+      if (!n) n = await assembleCanvasesToPdf(canvases, fileName);
+      if (!n) throw new Error("Failed to export PDF \u2014 no pages were rendered.");
       setImportStatus({ type: "success", message: `Saved PDF with ${n} A4 page${n === 1 ? "" : "s"} \u2014 identical to the preview! \u{1F495}` });
     } catch (err) {
       console.error(err);
@@ -778,13 +882,27 @@ ${lines.join("\n\n")}
         throw new Error("Nothing to print yet \u2014 add some entries first.");
       }
       const canvases = await buildAllPagesCanvases();
-      const n = await exportDiaryToA4Pdf({
-        pages: canvases.map((canvas) => ({ canvas })),
-        fileName: `our-love-story-${(/* @__PURE__ */ new Date()).toISOString().split("T")[0]}.pdf`,
-        onPageProgress: (done, total) => setPdfProgress({ done, total }),
-        returnBlob: true
-      });
-      const blob = n.blob;
+      // Get a real PDF Blob: prefer the exporter's blob mode, fall back to our
+      // own jsPDF assembly so printing never fails.
+      let blob = null;
+      try {
+        const res = await exportDiaryToA4Pdf({
+          pages: canvases.map((canvas) => ({ canvas })),
+          fileName: `our-love-story-${(/* @__PURE__ */ new Date()).toISOString().split("T")[0]}.pdf`,
+          onPageProgress: (done, total) => setPdfProgress({ done, total }),
+          returnBlob: true
+        });
+        if (res && typeof res.catch === "function") {
+          blob = res.catch(() => null);
+        } else if (res && res.blob) {
+          blob = res.blob;
+        } else if (res && typeof res.save === "function") {
+          blob = res.output ? res.output("blob") : null;
+        }
+      } catch (e) {
+        console.warn("[print] exporter blob mode failed, assembling directly:", e);
+      }
+      if (!blob) blob = await buildPdfBlobFromCanvases(canvases);
       const url = URL.createObjectURL(blob);
       // Hidden iframe → print dialog with the EXACT same PDF bytes that
       // "Save as PDF" produces (no browser re-layout differences).
@@ -851,6 +969,13 @@ ${lines.join("\n\n")}
       /* @__PURE__ */ jsx("span", { children: importStatus.type === "success" ? "\u2705" : "\u274C" }),
       /* @__PURE__ */ jsx("span", { children: importStatus.message }),
       /* @__PURE__ */ jsx("button", { onClick: () => setImportStatus(null), className: "ml-2 opacity-70 hover:opacity-100", children: "\u2715" })
+    ] }),
+    /* Export progress overlay — visible while the PDF/print pages are rendered. */
+    exportingPdf && /* @__PURE__ */ jsxs("div", { className: "fixed bottom-4 left-1/2 -translate-x-1/2 z-50 bg-amber-900/90 text-white px-6 py-3 rounded-full shadow-lg flex items-center gap-3", children: [
+      /* @__PURE__ */ jsx("span", { className: "animate-pulse", children: "\u23F3" }),
+      /* @__PURE__ */ jsxs("span", { className: "font-medium", children: [
+        pdfProgress ? `Preparing PDF \u2014 page ${pdfProgress.done} of ${pdfProgress.total}\u2026` : "Preparing export\u2026"
+      ] })
     ] }),
     /* @__PURE__ */ jsx("header", { className: "bg-white/80 backdrop-blur-sm border-b border-amber-200 sticky top-0 z-10", children: /* @__PURE__ */ jsxs("div", { className: "max-w-4xl mx-auto px-4 py-4 flex items-center justify-between", children: [
       /* @__PURE__ */ jsxs("div", { className: "flex items-center gap-3", children: [
